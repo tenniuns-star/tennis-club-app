@@ -451,7 +451,7 @@ export default function App(){
 
   function startSession(){
     if(todayPlayers.length<4)return alert("최소 4명이 필요합니다.");
-    if(todayPlayers.length>6)return alert("최대 6명까지 가능합니다.");
+    if(todayPlayers.length>10)return alert("최대 10명까지 가능합니다.");
     const allStatus:Record<string,string>={};
     presentMembers.forEach(m=>{allStatus[m]=memberStatus[m]||"";});
     todayGuests.forEach(g=>{allStatus[g]=guestStatus[g]||"";});
@@ -852,18 +852,19 @@ export default function App(){
                   </div>
                   <div>
                     <p style={{margin:"0 0 6px",fontSize:13,color:C.gray}}>참가 인원</p>
-                    <p style={{margin:0,fontSize:14,fontWeight:500,color:todayPlayers.length>=4&&todayPlayers.length<=6?C.teal:C.coral}}>{todayPlayers.length}명 {todayPlayers.length>=4&&todayPlayers.length<=6?"✓":"⚠️"}</p>
+                    <p style={{margin:0,fontSize:14,fontWeight:500,color:todayPlayers.length>=4&&todayPlayers.length<=10?C.teal:C.coral}}>{todayPlayers.length}명 {todayPlayers.length>=4&&todayPlayers.length<=10?"✓":"⚠️"}</p>
                   </div>
                 </div>
                 <div style={{marginBottom:14}}>
                   <p style={{margin:"0 0 6px",fontSize:13,color:C.gray}}>📝 세션 메모</p>
                   <textarea value={sessionNoteInput} onChange={e=>setSessionNoteInput(e.target.value)} placeholder="날씨, 코트 상태 등..." rows={2} style={{width:"100%",fontSize:13,padding:"8px 12px",borderRadius:8,border:"1px solid #D1D5DB",outline:"none",resize:"vertical",fontFamily:"inherit",boxSizing:"border-box"}}/>
                 </div>
-                {todayPlayers.length>=4&&todayPlayers.length<=6&&(
+                {todayPlayers.length>=4&&todayPlayers.length<=10&&(
                   <div style={{background:C.tealL,borderRadius:8,padding:"8px 12px",marginBottom:12,fontSize:12,color:C.tealD}}>오늘 참가자: {todayPlayers.join(", ")}</div>
                 )}
-                <button onClick={startSession} disabled={todayPlayers.length<4||todayPlayers.length>6} style={{padding:"10px 22px",borderRadius:8,fontSize:14,cursor:todayPlayers.length>=4?"pointer":"not-allowed",background:todayPlayers.length>=4&&todayPlayers.length<=6?C.teal:"#E5E7EB",color:todayPlayers.length>=4&&todayPlayers.length<=6?"#fff":C.gray,border:"none",fontWeight:500}}>🎾 대진표 생성</button>
+                <button onClick={startSession} disabled={todayPlayers.length<4||todayPlayers.length>10} style={{padding:"10px 22px",borderRadius:8,fontSize:14,cursor:todayPlayers.length>=4&&todayPlayers.length<=10?"pointer":"not-allowed",background:todayPlayers.length>=4&&todayPlayers.length<=10?C.teal:"#E5E7EB",color:todayPlayers.length>=4&&todayPlayers.length<=10?"#fff":C.gray,border:"none",fontWeight:500}}>🎾 대진표 생성</button>
                 {todayPlayers.length<4&&<p style={{margin:"8px 0 0",fontSize:12,color:C.coral}}>최소 4명 이상 선택해주세요.</p>}
+                {todayPlayers.length>10&&<p style={{margin:"8px 0 0",fontSize:12,color:C.coral}}>최대 10명까지 가능합니다.</p>}
               </div>
             </div>
           </div>

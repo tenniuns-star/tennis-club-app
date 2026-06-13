@@ -173,8 +173,22 @@ function calcParticipation(players:string[],numGames:number,playerStatus:Record<
 }
 function emptyScore():ScoreInput{return{a:"",b:"",draw:false,saved:false};}
 
-function PastSessionDetail({session,onBack,onDelete,onSaveNote}:{session:Session;onBack:()=>void;onDelete:()=>void;onSaveNote:(note:string)=>void;}){
+function PastSessionDetail({session,onBack,onDelete,onSaveNote,onSaveScores}:{session:Session;onBack:()=>void;onDelete:()=>void;onSaveNote:(note:string)=>void;onSaveScores:(matches:CompletedMatch[])=>void;}){
   const[localNote,setLocalNote]=useState(session.note||"");
+  const[editingIdx,setEditingIdx]=useState<number|null>(null);
+  const[editScore,setEditScore]=useState<{a:string;b:string}>({a:"",b:""});
+
+  function startEdit(i:number,m:CompletedMatch){setEditingIdx(i);setEditScore({a:m.score1,b:m.score2});}
+  function saveEdit(i:number){
+    if(editScore.a===""||editScore.b==="")return alert("스코어를 입력해주세요.");
+    const isDraw=parseInt(editScore.a)===parseInt(editScore.b);
+    const m=session.matches[i];
+    const updated:CompletedMatch={...m,score1:editScore.a,score2:editScore.b,draw:isDraw,winner:isDraw?null:parseInt(editScore.a)>parseInt(editScore.b)?m.pair1:m.pair2};
+    const newMatches=session.matches.map((x,j)=>j===i?updated:x);
+    onSaveScores(newMatches);
+    setEditingIdx(null);
+  }
+
   return(
     <div style={{fontFamily:"system-ui,sans-serif",maxWidth:720,margin:"0 auto",background:"#F9FAFB",minHeight:"100vh"}}>
       <div style={{background:`linear-gradient(135deg,${C.teal},${C.tealD})`,padding:"20px"}}>
@@ -197,23 +211,49 @@ function PastSessionDetail({session,onBack,onDelete,onSaveNote}:{session:Session
           const wk=m.draw?null:pairKey(m.winner!);
           const p1win=!m.draw&&wk===pairKey(m.pair1);
           const p2win=!m.draw&&wk===pairKey(m.pair2);
+          const isEditing=editingIdx===i;
+          const drawNow=editScore.a!==""&&editScore.b!==""&&parseInt(editScore.a)===parseInt(editScore.b);
           return(
             <div key={i} style={{background:"#fff",border:`1px solid ${m.draw?C.amber:p1win?C.teal:C.coral}`,borderRadius:12,padding:"14px 16px"}}>
               <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}>
                 <span style={{fontSize:12,fontWeight:500,color:C.gray,background:C.grayL,padding:"2px 8px",borderRadius:10}}>게임 {i+1}</span>
-                {m.draw?<span style={{fontSize:12,color:C.amberD,fontWeight:500}}>🤝 무승부 {m.score1}:{m.score2}</span>:<span style={{fontSize:12,color:C.tealD,fontWeight:500}}>✓ {m.score1}:{m.score2}</span>}
-              </div>
-              <div style={{display:"flex",alignItems:"center",gap:10}}>
-                <div style={{flex:1,background:p1win?C.tealL:m.draw?C.amberL:C.grayL,borderRadius:8,padding:"10px",textAlign:"center",border:p1win?`1px solid ${C.teal}`:m.draw?`1px solid ${C.amber}`:"none"}}>
-                  <p style={{fontSize:13,margin:"0 0 4px",fontWeight:500,color:p1win?C.tealD:m.draw?C.amberD:"#111"}}>{m.pair1.join(" & ")}</p>
-                  <p style={{fontSize:22,margin:0,fontWeight:600,color:p1win?C.teal:m.draw?C.amber:C.gray}}>{m.score1}</p>
-                </div>
-                <span style={{fontSize:13,color:C.gray}}>{m.draw?"🤝":"vs"}</span>
-                <div style={{flex:1,background:p2win?C.coralL:m.draw?C.amberL:C.grayL,borderRadius:8,padding:"10px",textAlign:"center",border:p2win?`1px solid ${C.coral}`:m.draw?`1px solid ${C.amber}`:"none"}}>
-                  <p style={{fontSize:13,margin:"0 0 4px",fontWeight:500,color:p2win?C.coralD:m.draw?C.amberD:"#111"}}>{m.pair2.join(" & ")}</p>
-                  <p style={{fontSize:22,margin:0,fontWeight:600,color:p2win?C.coral:m.draw?C.amber:C.gray}}>{m.score2}</p>
+                <div style={{display:"flex",alignItems:"center",gap:8}}>
+                  {m.draw?<span style={{fontSize:12,color:C.amberD,fontWeight:500}}>🤝 무승부 {m.score1}:{m.score2}</span>:<span style={{fontSize:12,color:C.tealD,fontWeight:500}}>✓ {m.score1}:{m.score2}</span>}
+                  {!isEditing&&<button onClick={()=>startEdit(i,m)} style={{fontSize:11,padding:"2px 8px",borderRadius:8,border:`1px solid ${C.teal}`,background:C.tealL,color:C.tealD,cursor:"pointer"}}>✏️ 수정</button>}
                 </div>
               </div>
+              {isEditing?(
+                <>
+                  <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:16,marginBottom:10}}>
+                    <div style={{textAlign:"center"}}>
+                      <p style={{margin:"0 0 4px",fontSize:11,color:C.gray}}>{m.pair1.join(" & ")}</p>
+                      <input type="number" min="0" max="99" value={editScore.a} onChange={e=>setEditScore(p=>({...p,a:e.target.value}))} style={{width:80,fontSize:32,padding:"10px",borderRadius:10,border:`2px solid ${drawNow?C.amber:C.teal}`,outline:"none",textAlign:"center",fontWeight:700}}/>
+                    </div>
+                    <span style={{fontSize:24,color:drawNow?C.amber:C.gray,fontWeight:700,marginTop:16}}>{drawNow?"🤝":":"}</span>
+                    <div style={{textAlign:"center"}}>
+                      <p style={{margin:"0 0 4px",fontSize:11,color:C.gray}}>{m.pair2.join(" & ")}</p>
+                      <input type="number" min="0" max="99" value={editScore.b} onChange={e=>setEditScore(p=>({...p,b:e.target.value}))} style={{width:80,fontSize:32,padding:"10px",borderRadius:10,border:`2px solid ${drawNow?C.amber:C.coral}`,outline:"none",textAlign:"center",fontWeight:700}}/>
+                    </div>
+                  </div>
+                  {drawNow&&<p style={{margin:"0 0 8px",fontSize:11,color:C.amberD,textAlign:"center"}}>🤝 동점 — 저장 시 무승부로 처리됩니다</p>}
+                  <div style={{display:"flex",gap:8}}>
+                    <button onClick={()=>setEditingIdx(null)} style={{flex:1,padding:"10px",borderRadius:8,fontSize:13,cursor:"pointer",border:"1px solid #E5E7EB",background:"#fff",color:C.gray}}>취소</button>
+                    <button onClick={()=>saveEdit(i)} style={{flex:2,padding:"10px",borderRadius:8,fontSize:14,cursor:"pointer",background:drawNow?C.amber:C.teal,color:"#fff",border:"none",fontWeight:600}}>저장</button>
+                  </div>
+                </>
+              ):(
+                <div style={{display:"flex",alignItems:"center",gap:10}}>
+                  <div style={{flex:1,background:p1win?C.tealL:m.draw?C.amberL:C.grayL,borderRadius:8,padding:"10px",textAlign:"center",border:p1win?`1px solid ${C.teal}`:m.draw?`1px solid ${C.amber}`:"none"}}>
+                    <p style={{fontSize:13,margin:"0 0 4px",fontWeight:500,color:p1win?C.tealD:m.draw?C.amberD:"#111"}}>{m.pair1.join(" & ")}</p>
+                    <p style={{fontSize:22,margin:0,fontWeight:600,color:p1win?C.teal:m.draw?C.amber:C.gray}}>{m.score1}</p>
+                  </div>
+                  <span style={{fontSize:13,color:C.gray}}>{m.draw?"🤝":"vs"}</span>
+                  <div style={{flex:1,background:p2win?C.coralL:m.draw?C.amberL:C.grayL,borderRadius:8,padding:"10px",textAlign:"center",border:p2win?`1px solid ${C.coral}`:m.draw?`1px solid ${C.amber}`:"none"}}>
+                    <p style={{fontSize:13,margin:"0 0 4px",fontWeight:500,color:p2win?C.coralD:m.draw?C.amberD:"#111"}}>{m.pair2.join(" & ")}</p>
+                    <p style={{fontSize:22,margin:0,fontWeight:600,color:p2win?C.coral:m.draw?C.amber:C.gray}}>{m.score2}</p>
+                  </div>
+                </div>
+              )}
             </div>
           );
         })}
@@ -229,6 +269,7 @@ export default function App(){
   const[loading,setLoading]=useState(true);
   const[syncStatus,setSyncStatus]=useState<"ok"|"syncing"|"error"|"realtime">("ok");
   const realtimeRef=useRef<SupabaseRealtime|null>(null);
+  const[showPastSessions,setShowPastSessions]=useState(false);
 
   const MEMBERS=config.members;
 
@@ -380,6 +421,15 @@ export default function App(){
     }catch(e){alert("메모 저장 실패.");}
   }
 
+  async function updateSessionScores(idx:number,matches:CompletedMatch[]){
+    const s=sessions[idx];
+    try{
+      if(s.id)await sbFetch(`/sessions?id=eq.${s.id}`,{method:"PATCH",body:JSON.stringify({matches})});
+      setSessions(prev=>prev.map((ss,i)=>i===idx?{...ss,matches}:ss));
+      alert("스코어가 수정됐습니다!");
+    }catch(e){alert("스코어 수정 실패.");}
+  }
+
   async function saveGuestDB(g:Guest){
     setSyncStatus("syncing");
     try{
@@ -430,6 +480,7 @@ export default function App(){
   }
   function addQuickGuest(){
     const name=quickName.trim();if(!name)return;
+    if(MEMBERS.includes(name))return alert(`${name}은(는) 정회원입니다. 위 출석 체크에서 선택해주세요.`);
     const date=todayStr();
     const existing=guests.find(g=>g.name===name);
     if(existing){
@@ -628,7 +679,7 @@ export default function App(){
   if(pastSessionIdx!==null&&tab===1){
     const s=sessions[pastSessionIdx];
     if(!s){setPastSessionIdx(null);return null;}
-    return(<PastSessionDetail session={s} onBack={()=>setPastSessionIdx(null)} onDelete={()=>deleteSessionDB(pastSessionIdx)} onSaveNote={note=>updateSessionNote(pastSessionIdx,note)}/>);
+    return(<PastSessionDetail session={s} onBack={()=>setPastSessionIdx(null)} onDelete={()=>deleteSessionDB(pastSessionIdx)} onSaveNote={note=>updateSessionNote(pastSessionIdx,note)} onSaveScores={matches=>updateSessionScores(pastSessionIdx,matches)}/>);
   }
 
   if(profilePlayer){
@@ -876,28 +927,37 @@ export default function App(){
               <div style={{borderRadius:12,overflow:"hidden",border:"1px solid #E5E7EB",marginBottom:14}}>
                 <div style={{background:C.gray,padding:"10px 16px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                   <span style={{fontSize:14,fontWeight:500,color:"#fff"}}>📂 지난 대진표</span>
-                  <span style={{fontSize:12,color:"rgba(255,255,255,0.7)"}}>총 {sessions.length}회</span>
+                  <div style={{display:"flex",alignItems:"center",gap:8}}>
+                    <span style={{fontSize:12,color:"rgba(255,255,255,0.7)"}}>총 {sessions.length}회</span>
+                    {activeSession&&(
+                      <button onClick={()=>setShowPastSessions(p=>!p)} style={{fontSize:11,padding:"3px 10px",borderRadius:8,border:"1px solid rgba(255,255,255,0.4)",background:"rgba(255,255,255,0.15)",color:"#fff",cursor:"pointer"}}>
+                        {showPastSessions?"접기 ▲":"더보기 ▼"}
+                      </button>
+                    )}
+                  </div>
                 </div>
-                <div style={{background:"#fff",padding:"10px 16px",display:"grid",gap:6}}>
-                  {[...sessions].reverse().map((s,i)=>{
-                    const realIdx=sessions.length-1-i;
-                    return(
-                      <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 12px",borderRadius:8,border:"1px solid #E5E7EB"}}>
-                        <button onClick={()=>setPastSessionIdx(realIdx)} style={{flex:1,display:"flex",flexDirection:"column",gap:2,background:"none",border:"none",cursor:"pointer",textAlign:"left",padding:0}}>
-                          <div style={{display:"flex",alignItems:"center",gap:8}}>
-                            <span style={{fontSize:13,fontWeight:500,color:"#111"}}>{s.date}</span>
-                            <span style={{fontSize:11,color:C.gray}}>{s.players.join(", ")}</span>
+                {(!activeSession||showPastSessions)&&(
+                  <div style={{background:"#fff",padding:"10px 16px",display:"grid",gap:6}}>
+                    {[...sessions].reverse().map((s,i)=>{
+                      const realIdx=sessions.length-1-i;
+                      return(
+                        <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 12px",borderRadius:8,border:"1px solid #E5E7EB"}}>
+                          <button onClick={()=>setPastSessionIdx(realIdx)} style={{flex:1,display:"flex",flexDirection:"column",gap:2,background:"none",border:"none",cursor:"pointer",textAlign:"left",padding:0}}>
+                            <div style={{display:"flex",alignItems:"center",gap:8}}>
+                              <span style={{fontSize:13,fontWeight:500,color:"#111"}}>{s.date}</span>
+                              <span style={{fontSize:11,color:C.gray}}>{s.players.join(", ")}</span>
+                            </div>
+                            {s.note&&<span style={{fontSize:11,color:C.tealD,background:C.tealL,padding:"1px 6px",borderRadius:4}}>📝 {s.note.slice(0,30)}{s.note.length>30?"...":""}</span>}
+                          </button>
+                          <div style={{display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
+                            <span style={{fontSize:12,color:C.teal,fontWeight:500}}>{s.matches.length}게임</span>
+                            <button onClick={()=>deleteSessionDB(realIdx)} style={{fontSize:11,padding:"3px 8px",borderRadius:6,border:"1px solid #FECACA",background:"#FEF2F2",color:C.coral,cursor:"pointer"}}>삭제</button>
                           </div>
-                          {s.note&&<span style={{fontSize:11,color:C.tealD,background:C.tealL,padding:"1px 6px",borderRadius:4}}>📝 {s.note.slice(0,30)}{s.note.length>30?"...":""}</span>}
-                        </button>
-                        <div style={{display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
-                          <span style={{fontSize:12,color:C.teal,fontWeight:500}}>{s.matches.length}게임</span>
-                          <button onClick={()=>deleteSessionDB(realIdx)} style={{fontSize:11,padding:"3px 8px",borderRadius:6,border:"1px solid #FECACA",background:"#FEF2F2",color:C.coral,cursor:"pointer"}}>삭제</button>
                         </div>
-                      </div>
-                    );
-                  })}
-                </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             )}
             {!activeSession?(
@@ -945,13 +1005,13 @@ export default function App(){
                         </div>
                         {!s.saved?(
                           <>
-                            <div style={{display:"flex",alignItems:"center",gap:8}}>
-                              <input type="number" min="0" max="99" placeholder="A" value={s.a} onChange={e=>updateScore(i,"a",e.target.value)} style={{width:64,fontSize:24,padding:"8px",borderRadius:8,border:`1.5px solid ${drawNow?C.amber:C.teal}`,outline:"none",textAlign:"center",fontWeight:700}}/>
-                              <span style={{fontSize:drawNow?20:14,color:drawNow?C.amber:C.gray}}>{drawNow?"🤝":":"}</span>
-                              <input type="number" min="0" max="99" placeholder="B" value={s.b} onChange={e=>updateScore(i,"b",e.target.value)} style={{width:64,fontSize:24,padding:"8px",borderRadius:8,border:`1.5px solid ${drawNow?C.amber:C.coral}`,outline:"none",textAlign:"center",fontWeight:700}}/>
-                              <button onClick={()=>saveScore(i)} style={{flex:1,padding:"10px",borderRadius:8,fontSize:14,cursor:"pointer",background:drawNow?C.amber:C.teal,color:"#fff",border:"none",fontWeight:600}}>저장</button>
+                            <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:16,marginBottom:10}}>
+                              <input type="number" min="0" max="99" placeholder="A" value={s.a} onChange={e=>updateScore(i,"a",e.target.value)} style={{width:80,fontSize:32,padding:"10px",borderRadius:10,border:`2px solid ${drawNow?C.amber:C.teal}`,outline:"none",textAlign:"center",fontWeight:700}}/>
+                              <span style={{fontSize:drawNow?24:18,color:drawNow?C.amber:C.gray,fontWeight:700}}>{drawNow?"🤝":":"}</span>
+                              <input type="number" min="0" max="99" placeholder="B" value={s.b} onChange={e=>updateScore(i,"b",e.target.value)} style={{width:80,fontSize:32,padding:"10px",borderRadius:10,border:`2px solid ${drawNow?C.amber:C.coral}`,outline:"none",textAlign:"center",fontWeight:700}}/>
                             </div>
-                            {drawNow&&<p style={{margin:"6px 0 0",fontSize:11,color:C.amberD,textAlign:"center"}}>🤝 동점 — 저장 시 무승부로 처리됩니다</p>}
+                            {drawNow&&<p style={{margin:"0 0 8px",fontSize:11,color:C.amberD,textAlign:"center"}}>🤝 동점 — 저장 시 무승부로 처리됩니다</p>}
+                            <button onClick={()=>saveScore(i)} style={{width:"100%",padding:"12px",borderRadius:8,fontSize:15,cursor:"pointer",background:drawNow?C.amber:C.teal,color:"#fff",border:"none",fontWeight:600}}>저장</button>
                           </>
                         ):(
                           <div style={{display:"flex",gap:8}}>

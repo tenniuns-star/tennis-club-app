@@ -22,86 +22,6 @@ async function sbFetch(path: string, options: RequestInit = {}) {
   const text = await res.text();
   return text ? JSON.parse(text) : [];
 }
-
-// ─── Supabase Realtime 웹소켓 ────────────────────────────────
-class SupabaseRealtime {
-  private ws: WebSocket | null = null;
-  private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
-  private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
-  private listeners: Map<string, (payload: any) => void> = new Map();
-  private connected = false;
-  private shouldReconnect = true;
-  private ref = 1;
-
-  connect(onConnect?: () => void) {
-    this.shouldReconnect = true;
-    const wsUrl = `${SUPABASE_URL.replace("https://", "wss://")}/realtime/v1/websocket?apikey=${SUPABASE_KEY}&vsn=1.0.0`;
-    this.ws = new WebSocket(wsUrl);
-
-    this.ws.onopen = () => {
-      this.connected = true;
-      // heartbeat
-      this.heartbeatInterval = setInterval(() => {
-        this.send({ topic: "phoenix", event: "heartbeat", payload: {}, ref: String(this.ref++) });
-      }, 20000);
-      onConnect?.();
-    };
-
-    this.ws.onmessage = (e) => {
-      try {
-        const msg = JSON.parse(e.data);
-        if (msg.event === "phx_reply" || msg.event === "heartbeat") return;
-        if (msg.event === "postgres_changes") {
-          const table = msg.payload?.data?.table;
-          if (table) {
-            this.listeners.get(table)?.(msg.payload?.data);
-          }
-        }
-      } catch {}
-    };
-
-    this.ws.onclose = () => {
-      this.connected = false;
-      if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
-      if (this.shouldReconnect) {
-        this.reconnectTimeout = setTimeout(() => this.connect(onConnect), 3000);
-      }
-    };
-
-    this.ws.onerror = () => {
-      this.ws?.close();
-    };
-  }
-
-  private send(msg: object) {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(msg));
-    }
-  }
-
-  subscribe(table: string, callback: (payload: any) => void) {
-    this.listeners.set(table, callback);
-    const topic = `realtime:public:${table}`;
-    this.send({
-      topic,
-      event: "phx_join",
-      payload: {
-        config: {
-          broadcast: { self: false },
-          postgres_changes: [{ event: "*", schema: "public", table }],
-        },
-      },
-      ref: String(this.ref++),
-    });
-  }
-
-  disconnect() {
-    this.shouldReconnect = false;
-    if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
-    if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout);
-    this.ws?.close();
-  }
-}
 // ─────────────────────────────────────────────────────────────
 
 const DEFAULT_MEMBERS = ["조혜경", "김신영", "이화정", "김나나", "한혜준"];
@@ -129,10 +49,185 @@ interface ScoreInput{a:string;b:string;draw:boolean;saved:boolean;}
 interface CompletedMatch{pair1:string[];pair2:string[];score1:string;score2:string;winner:string[]|null;draw:boolean;}
 interface Session{id?:string;date:string;players:string[];matches:CompletedMatch[];playerStatus:Record<string,string>;note?:string;}
 interface Guest{id:number;name:string;visits:string[];phone:string;level:string;note:string;}
-interface ActiveSession{date:string;players:string[];matches:Match[];scoreInputs:Record<number,ScoreInput>;playerStatus:Record<string,string>;numGames:number;note:string;}
+
+// ─── 로테이션 누적 기록 ───────────────────────────────────────
+interface PlayRecord {
+  players: string[];      // 실제 플레이한 4명
+  pair1: string[];
+  pair2: string[];
+  rested: string[];       // 쉰 사람
+}
+
+interface ActiveSession{
+  date:string;
+  players:string[];
+  matches:Match[];
+  scoreInputs:Record<number,ScoreInput>;
+  playerStatus:Record<string,string>;
+  numGames:number;
+  note:string;
+  // 로테이션 누적 기록
+  playHistory: PlayRecord[];          // 저장된 게임들의 실제 기록
+  consecutiveCount: Record<string,number>; // 연속 게임 횟수
+  lastRested: Record<string,number>;  // 마지막으로 쉰 게임 인덱스
+  // 파트너/상대 누적 (KDK용)
+  partnerCount: Record<string,Record<string,number>>;
+  opponentCount: Record<string,Record<string,number>>;
+}
+
 interface GuestForm{name:string;phone:string;level:string;note:string;}
 interface AppConfig{clubName:string;clubSubtitle:string;members:string[];nextSessionNote:string;}
 
+// ─── 다음 게임 자동 생성 핵심 로직 ───────────────────────────
+function generateNextMatch(
+  allPlayers: string[],
+  playHistory: PlayRecord[],
+  consecutiveCount: Record<string,number>,
+  lastRested: Record<string,number>,
+  playerStatus: Record<string,string>,
+  gameIndex: number, // 다음 게임이 몇 번째인지 (0-based)
+  numGames: number,
+  partnerCount: Record<string,Record<string,number>>,
+  opponentCount: Record<string,Record<string,number>>,
+): Match {
+  const n = allPlayers.length;
+
+  // 늦참: 첫 게임(gameIndex===0) 제외
+  // 일퇴: 마지막 2게임(gameIndex >= numGames-2) 제외
+  const available = allPlayers.filter(p => {
+    const st = playerStatus[p] || "";
+    if (st === "late" && gameIndex === 0) return false;
+    if (st === "early" && gameIndex >= numGames - 2) return false;
+    return true;
+  });
+
+  let selected: string[] = [];
+
+  if (available.length <= 4) {
+    // 4명 이하: 전원 참가
+    selected = [...available];
+  } else if (available.length === 5) {
+    // 5명: 1명 대기
+    selected = selectFivePlayers(available, playHistory, consecutiveCount, lastRested, gameIndex);
+  } else {
+    // 6명: 2명 대기
+    selected = selectSixPlayers(available, playHistory, consecutiveCount, lastRested, gameIndex);
+  }
+
+  // 4명 확정 후 KDK 페어 최적화
+  return bestPair(selected, partnerCount, opponentCount);
+}
+
+function selectFivePlayers(
+  players: string[],
+  playHistory: PlayRecord[],
+  consecutiveCount: Record<string,number>,
+  lastRested: Record<string,number>,
+  gameIndex: number
+): string[] {
+  // 직전에 쉰 사람 우선 투입
+  const lastGame = playHistory[playHistory.length - 1];
+  const restedLast = lastGame ? lastGame.rested : [];
+
+  // 연속 게임 수 기준으로 정렬 (많이 뛴 사람이 쉬어야 함)
+  const sorted = [...players].sort((a, b) => {
+    const ac = consecutiveCount[a] || 0;
+    const bc = consecutiveCount[b] || 0;
+    // 직전에 쉰 사람은 우선순위 높게 (연속=0이므로 자연스럽게 반영됨)
+    return bc - ac; // 연속 많은 사람이 뒤로 (쉬어야 하므로)
+  });
+
+  // 연속이 가장 많은 1명을 쉬게 함
+  // 단 직전에 쉰 사람은 무조건 포함
+  let mustPlay = restedLast.filter(p => players.includes(p));
+  let candidates = players.filter(p => !mustPlay.includes(p));
+
+  // 연속 많은 순으로 정렬해서 1명 제외
+  candidates.sort((a, b) => (consecutiveCount[b]||0) - (consecutiveCount[a]||0));
+
+  // mustPlay + candidates에서 4명 선발
+  const pool = [...mustPlay, ...candidates];
+  return pool.slice(0, 4);
+}
+
+function selectSixPlayers(
+  players: string[],
+  playHistory: PlayRecord[],
+  consecutiveCount: Record<string,number>,
+  lastRested: Record<string,number>,
+  gameIndex: number
+): string[] {
+  const lastGame = playHistory[playHistory.length - 1];
+  const restedLast = lastGame ? lastGame.rested : [];
+
+  // 직전에 쉰 사람(2명) 우선 투입
+  let mustPlay = restedLast.filter(p => players.includes(p));
+
+  // 연속 2게임 이상인 사람은 강제 휴식
+  const forcedRest = players.filter(p =>
+    !mustPlay.includes(p) && (consecutiveCount[p] || 0) >= 2
+  );
+
+  // 나머지 후보들
+  let candidates = players.filter(p =>
+    !mustPlay.includes(p) && !forcedRest.includes(p)
+  );
+
+  // mustPlay가 4명 이상이면 그냥 4명만 선발
+  if (mustPlay.length >= 4) {
+    return mustPlay.slice(0, 4);
+  }
+
+  // 나머지 자리 채우기: 연속 횟수 적은 사람 우선
+  const needed = 4 - mustPlay.length;
+  candidates.sort((a, b) => (consecutiveCount[a]||0) - (consecutiveCount[b]||0));
+
+  return [...mustPlay, ...candidates.slice(0, needed)];
+}
+
+function bestPair(
+  players: string[],
+  partnerCount: Record<string,Record<string,number>>,
+  opponentCount: Record<string,Record<string,number>>,
+): Match {
+  if (players.length < 4) {
+    // 예외 처리
+    return { pair1: players.slice(0,2), pair2: players.slice(2,4) };
+  }
+
+  const [a, b, c, d] = players;
+  // 가능한 페어 조합 3가지
+  const combos: Match[] = [
+    { pair1: [a,b], pair2: [c,d] },
+    { pair1: [a,c], pair2: [b,d] },
+    { pair1: [a,d], pair2: [b,c] },
+  ];
+
+  let bestCombo = combos[0];
+  let bestScore = Infinity;
+
+  combos.forEach(m => {
+    const [p1a, p1b] = m.pair1;
+    const [p2a, p2b] = m.pair2;
+    const score =
+      (partnerCount[p1a]?.[p1b] || 0) +
+      (partnerCount[p1b]?.[p1a] || 0) +
+      (partnerCount[p2a]?.[p2b] || 0) +
+      (partnerCount[p2b]?.[p2a] || 0) +
+      (opponentCount[p1a]?.[p2a] || 0) +
+      (opponentCount[p1a]?.[p2b] || 0) +
+      (opponentCount[p1b]?.[p2a] || 0) +
+      (opponentCount[p1b]?.[p2b] || 0);
+    if (score < bestScore) {
+      bestScore = score;
+      bestCombo = m;
+    }
+  });
+
+  return bestCombo;
+}
+
+// KDK 초기 대진표 생성 (첫 게임만 or 전체 미리보기용)
 function generateKDK(players:string[],numGames:number,playerStatus:Record<string,string>={}):Match[]{
   function availFor(gi:number){return players.filter(p=>{const st=playerStatus[p]||"";if(st==="late"&&gi===0)return false;if(st==="early"&&gi>=numGames-2)return false;return true;});}
   function combosFor(pl:string[]):Match[]{
@@ -166,6 +261,39 @@ function generateKDK(players:string[],numGames:number,playerStatus:Record<string
   return selected;
 }
 
+// 누적 카운트 초기화
+function initCounts(players: string[]) {
+  const pc: Record<string,Record<string,number>> = {};
+  const oc: Record<string,Record<string,number>> = {};
+  players.forEach(p => {
+    pc[p] = {}; oc[p] = {};
+    players.forEach(q => { pc[p][q] = 0; oc[p][q] = 0; });
+  });
+  return { pc, oc };
+}
+
+// 저장된 게임으로부터 누적 카운트 업데이트
+function updateCounts(
+  pair1: string[],
+  pair2: string[],
+  pc: Record<string,Record<string,number>>,
+  oc: Record<string,Record<string,number>>,
+) {
+  const [a, b] = pair1;
+  const [c, d] = pair2;
+  if (!pc[a]) pc[a] = {};
+  if (!pc[b]) pc[b] = {};
+  if (!pc[c]) pc[c] = {};
+  if (!pc[d]) pc[d] = {};
+  pc[a][b] = (pc[a][b]||0)+1; pc[b][a] = (pc[b][a]||0)+1;
+  pc[c][d] = (pc[c][d]||0)+1; pc[d][c] = (pc[d][c]||0)+1;
+  [a,b].forEach(p=>[c,d].forEach(q=>{
+    if (!oc[p]) oc[p] = {};
+    if (!oc[q]) oc[q] = {};
+    oc[p][q]=(oc[p][q]||0)+1;oc[q][p]=(oc[q][p]||0)+1;
+  }));
+}
+
 function calcParticipation(players:string[],numGames:number,playerStatus:Record<string,string>={}){
   const result:Record<string,number[]>={};
   players.forEach(p=>{result[p]=[];for(let i=0;i<numGames;i++){const st=playerStatus[p]||"";if(st==="late"&&i===0)continue;if(st==="early"&&i>=numGames-2)continue;result[p].push(i);}});
@@ -173,22 +301,8 @@ function calcParticipation(players:string[],numGames:number,playerStatus:Record<
 }
 function emptyScore():ScoreInput{return{a:"",b:"",draw:false,saved:false};}
 
-function PastSessionDetail({session,onBack,onDelete,onSaveNote,onSaveScores}:{session:Session;onBack:()=>void;onDelete:()=>void;onSaveNote:(note:string)=>void;onSaveScores:(matches:CompletedMatch[])=>void;}){
+function PastSessionDetail({session,onBack,onDelete,onSaveNote}:{session:Session;onBack:()=>void;onDelete:()=>void;onSaveNote:(note:string)=>void;}){
   const[localNote,setLocalNote]=useState(session.note||"");
-  const[editingIdx,setEditingIdx]=useState<number|null>(null);
-  const[editScore,setEditScore]=useState<{a:string;b:string}>({a:"",b:""});
-
-  function startEdit(i:number,m:CompletedMatch){setEditingIdx(i);setEditScore({a:m.score1,b:m.score2});}
-  function saveEdit(i:number){
-    if(editScore.a===""||editScore.b==="")return alert("스코어를 입력해주세요.");
-    const isDraw=parseInt(editScore.a)===parseInt(editScore.b);
-    const m=session.matches[i];
-    const updated:CompletedMatch={...m,score1:editScore.a,score2:editScore.b,draw:isDraw,winner:isDraw?null:parseInt(editScore.a)>parseInt(editScore.b)?m.pair1:m.pair2};
-    const newMatches=session.matches.map((x,j)=>j===i?updated:x);
-    onSaveScores(newMatches);
-    setEditingIdx(null);
-  }
-
   return(
     <div style={{fontFamily:"system-ui,sans-serif",maxWidth:720,margin:"0 auto",background:"#F9FAFB",minHeight:"100vh"}}>
       <div style={{background:`linear-gradient(135deg,${C.teal},${C.tealD})`,padding:"20px"}}>
@@ -211,49 +325,23 @@ function PastSessionDetail({session,onBack,onDelete,onSaveNote,onSaveScores}:{se
           const wk=m.draw?null:pairKey(m.winner!);
           const p1win=!m.draw&&wk===pairKey(m.pair1);
           const p2win=!m.draw&&wk===pairKey(m.pair2);
-          const isEditing=editingIdx===i;
-          const drawNow=editScore.a!==""&&editScore.b!==""&&parseInt(editScore.a)===parseInt(editScore.b);
           return(
             <div key={i} style={{background:"#fff",border:`1px solid ${m.draw?C.amber:p1win?C.teal:C.coral}`,borderRadius:12,padding:"14px 16px"}}>
               <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}>
                 <span style={{fontSize:12,fontWeight:500,color:C.gray,background:C.grayL,padding:"2px 8px",borderRadius:10}}>게임 {i+1}</span>
-                <div style={{display:"flex",alignItems:"center",gap:8}}>
-                  {m.draw?<span style={{fontSize:12,color:C.amberD,fontWeight:500}}>🤝 무승부 {m.score1}:{m.score2}</span>:<span style={{fontSize:12,color:C.tealD,fontWeight:500}}>✓ {m.score1}:{m.score2}</span>}
-                  {!isEditing&&<button onClick={()=>startEdit(i,m)} style={{fontSize:11,padding:"2px 8px",borderRadius:8,border:`1px solid ${C.teal}`,background:C.tealL,color:C.tealD,cursor:"pointer"}}>✏️ 수정</button>}
+                {m.draw?<span style={{fontSize:12,color:C.amberD,fontWeight:500}}>🤝 무승부 {m.score1}:{m.score2}</span>:<span style={{fontSize:12,color:C.tealD,fontWeight:500}}>✓ {m.score1}:{m.score2}</span>}
+              </div>
+              <div style={{display:"flex",alignItems:"center",gap:10}}>
+                <div style={{flex:1,background:p1win?C.tealL:m.draw?C.amberL:C.grayL,borderRadius:8,padding:"10px",textAlign:"center",border:p1win?`1px solid ${C.teal}`:m.draw?`1px solid ${C.amber}`:"none"}}>
+                  <p style={{fontSize:13,margin:"0 0 4px",fontWeight:500,color:p1win?C.tealD:m.draw?C.amberD:"#111"}}>{m.pair1.join(" & ")}</p>
+                  <p style={{fontSize:22,margin:0,fontWeight:600,color:p1win?C.teal:m.draw?C.amber:C.gray}}>{m.score1}</p>
+                </div>
+                <span style={{fontSize:13,color:C.gray}}>{m.draw?"🤝":"vs"}</span>
+                <div style={{flex:1,background:p2win?C.coralL:m.draw?C.amberL:C.grayL,borderRadius:8,padding:"10px",textAlign:"center",border:p2win?`1px solid ${C.coral}`:m.draw?`1px solid ${C.amber}`:"none"}}>
+                  <p style={{fontSize:13,margin:"0 0 4px",fontWeight:500,color:p2win?C.coralD:m.draw?C.amberD:"#111"}}>{m.pair2.join(" & ")}</p>
+                  <p style={{fontSize:22,margin:0,fontWeight:600,color:p2win?C.coral:m.draw?C.amber:C.gray}}>{m.score2}</p>
                 </div>
               </div>
-              {isEditing?(
-                <>
-                  <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:16,marginBottom:10}}>
-                    <div style={{textAlign:"center"}}>
-                      <p style={{margin:"0 0 4px",fontSize:11,color:C.gray}}>{m.pair1.join(" & ")}</p>
-                      <input type="number" min="0" max="99" value={editScore.a} onChange={e=>setEditScore(p=>({...p,a:e.target.value}))} style={{width:80,fontSize:32,padding:"10px",borderRadius:10,border:`2px solid ${drawNow?C.amber:C.teal}`,outline:"none",textAlign:"center",fontWeight:700}}/>
-                    </div>
-                    <span style={{fontSize:24,color:drawNow?C.amber:C.gray,fontWeight:700,marginTop:16}}>{drawNow?"🤝":":"}</span>
-                    <div style={{textAlign:"center"}}>
-                      <p style={{margin:"0 0 4px",fontSize:11,color:C.gray}}>{m.pair2.join(" & ")}</p>
-                      <input type="number" min="0" max="99" value={editScore.b} onChange={e=>setEditScore(p=>({...p,b:e.target.value}))} style={{width:80,fontSize:32,padding:"10px",borderRadius:10,border:`2px solid ${drawNow?C.amber:C.coral}`,outline:"none",textAlign:"center",fontWeight:700}}/>
-                    </div>
-                  </div>
-                  {drawNow&&<p style={{margin:"0 0 8px",fontSize:11,color:C.amberD,textAlign:"center"}}>🤝 동점 — 저장 시 무승부로 처리됩니다</p>}
-                  <div style={{display:"flex",gap:8}}>
-                    <button onClick={()=>setEditingIdx(null)} style={{flex:1,padding:"10px",borderRadius:8,fontSize:13,cursor:"pointer",border:"1px solid #E5E7EB",background:"#fff",color:C.gray}}>취소</button>
-                    <button onClick={()=>saveEdit(i)} style={{flex:2,padding:"10px",borderRadius:8,fontSize:14,cursor:"pointer",background:drawNow?C.amber:C.teal,color:"#fff",border:"none",fontWeight:600}}>저장</button>
-                  </div>
-                </>
-              ):(
-                <div style={{display:"flex",alignItems:"center",gap:10}}>
-                  <div style={{flex:1,background:p1win?C.tealL:m.draw?C.amberL:C.grayL,borderRadius:8,padding:"10px",textAlign:"center",border:p1win?`1px solid ${C.teal}`:m.draw?`1px solid ${C.amber}`:"none"}}>
-                    <p style={{fontSize:13,margin:"0 0 4px",fontWeight:500,color:p1win?C.tealD:m.draw?C.amberD:"#111"}}>{m.pair1.join(" & ")}</p>
-                    <p style={{fontSize:22,margin:0,fontWeight:600,color:p1win?C.teal:m.draw?C.amber:C.gray}}>{m.score1}</p>
-                  </div>
-                  <span style={{fontSize:13,color:C.gray}}>{m.draw?"🤝":"vs"}</span>
-                  <div style={{flex:1,background:p2win?C.coralL:m.draw?C.amberL:C.grayL,borderRadius:8,padding:"10px",textAlign:"center",border:p2win?`1px solid ${C.coral}`:m.draw?`1px solid ${C.amber}`:"none"}}>
-                    <p style={{fontSize:13,margin:"0 0 4px",fontWeight:500,color:p2win?C.coralD:m.draw?C.amberD:"#111"}}>{m.pair2.join(" & ")}</p>
-                    <p style={{fontSize:22,margin:0,fontWeight:600,color:p2win?C.coral:m.draw?C.amber:C.gray}}>{m.score2}</p>
-                  </div>
-                </div>
-              )}
             </div>
           );
         })}
@@ -267,9 +355,7 @@ export default function App(){
   const[sessions,setSessions]=useState<Session[]>([]);
   const[guests,setGuests]=useState<Guest[]>([]);
   const[loading,setLoading]=useState(true);
-  const[syncStatus,setSyncStatus]=useState<"ok"|"syncing"|"error"|"realtime">("ok");
-  const realtimeRef=useRef<SupabaseRealtime|null>(null);
-  const[showPastSessions,setShowPastSessions]=useState(false);
+  const[syncStatus,setSyncStatus]=useState<"ok"|"syncing"|"error">("ok");
 
   const MEMBERS=config.members;
 
@@ -297,9 +383,8 @@ export default function App(){
   const[pwaInstallPrompt,setPwaInstallPrompt]=useState<any>(null);
   const[showPwaBtn,setShowPwaBtn]=useState(false);
   const[sessionNoteInput,setSessionNoteInput]=useState("");
-  const[realtimeConnected,setRealtimeConnected]=useState(false);
+  const jsonRef=useRef<HTMLInputElement>(null);
 
-  // ── Supabase 데이터 로드 ──
   useEffect(()=>{
     loadAll();
     const handler=(e:any)=>{e.preventDefault();setPwaInstallPrompt(e);setShowPwaBtn(true);};
@@ -308,64 +393,6 @@ export default function App(){
       const s=document.createElement("script");s.src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";s.onload=()=>setXlsxReady(true);document.head.appendChild(s);
     }
     return()=>window.removeEventListener("beforeinstallprompt",handler);
-  },[]);
-
-  // ── Supabase Realtime 연결 ──
-  useEffect(()=>{
-    const rt=new SupabaseRealtime();
-    realtimeRef.current=rt;
-
-    rt.connect(()=>{
-      setRealtimeConnected(true);
-
-      // sessions 테이블 구독
-      rt.subscribe("sessions",(payload)=>{
-        const evt=payload.type;
-        if(evt==="INSERT"){
-          const s=payload.record;
-          setSessions(prev=>{
-            // 이미 있으면 skip
-            if(prev.some(x=>x.id===s.id))return prev;
-            return[...prev,{id:s.id,date:s.date,players:s.players,matches:s.matches,playerStatus:s.player_status||{},note:s.note||""}];
-          });
-        }else if(evt==="UPDATE"){
-          const s=payload.record;
-          setSessions(prev=>prev.map(x=>x.id===s.id?{id:s.id,date:s.date,players:s.players,matches:s.matches,playerStatus:s.player_status||{},note:s.note||""}:x));
-        }else if(evt==="DELETE"){
-          const id=payload.old_record?.id;
-          if(id)setSessions(prev=>prev.filter(x=>x.id!==id));
-        }
-      });
-
-      // guests 테이블 구독
-      rt.subscribe("guests",(payload)=>{
-        const evt=payload.type;
-        if(evt==="INSERT"){
-          const g=payload.record;
-          setGuests(prev=>{
-            if(prev.some(x=>x.id===g.id))return prev;
-            return[...prev,{id:g.id,name:g.name,visits:g.visits||[],phone:g.phone||"",level:g.level||"중급",note:g.note||""}];
-          });
-        }else if(evt==="UPDATE"){
-          const g=payload.record;
-          setGuests(prev=>prev.map(x=>x.id===g.id?{id:g.id,name:g.name,visits:g.visits||[],phone:g.phone||"",level:g.level||"중급",note:g.note||""}:x));
-        }else if(evt==="DELETE"){
-          const id=payload.old_record?.id;
-          if(id)setGuests(prev=>prev.filter(x=>x.id!==id));
-        }
-      });
-
-      // config 테이블 구독
-      rt.subscribe("config",(payload)=>{
-        const evt=payload.type;
-        if(evt==="UPDATE"||evt==="INSERT"){
-          const c=payload.record;
-          setConfig({clubName:c.club_name||DEFAULT_CLUB_NAME,clubSubtitle:c.club_subtitle||DEFAULT_CLUB_SUBTITLE,members:c.members||DEFAULT_MEMBERS,nextSessionNote:c.next_session_note||""});
-        }
-      });
-    });
-
-    return()=>{rt.disconnect();setRealtimeConnected(false);};
   },[]);
 
   async function loadAll(){
@@ -391,12 +418,7 @@ export default function App(){
     try{
       const body={date:session.date,players:session.players,matches:session.matches,player_status:session.playerStatus,note:session.note||""};
       const res=await sbFetch("/sessions",{method:"POST",body:JSON.stringify(body),headers:{"Prefer":"return=representation"}});
-      // Realtime이 INSERT 이벤트를 받아서 자동으로 state 업데이트하므로
-      // 여기서 직접 setSessions하지 않아도 됨 (중복 방지 로직 포함)
-      setSessions(prev=>{
-        if(prev.some(x=>x.id===res[0]?.id))return prev;
-        return[...prev,{...session,id:res[0]?.id}];
-      });
+      setSessions(prev=>[...prev,{...session,id:res[0]?.id}]);
       setSyncStatus("ok");
     }catch(e){setSyncStatus("error");alert("저장 실패. 다시 시도해주세요.");}
   }
@@ -419,15 +441,6 @@ export default function App(){
       if(s.id)await sbFetch(`/sessions?id=eq.${s.id}`,{method:"PATCH",body:JSON.stringify({note})});
       setSessions(prev=>prev.map((ss,i)=>i===idx?{...ss,note}:ss));
     }catch(e){alert("메모 저장 실패.");}
-  }
-
-  async function updateSessionScores(idx:number,matches:CompletedMatch[]){
-    const s=sessions[idx];
-    try{
-      if(s.id)await sbFetch(`/sessions?id=eq.${s.id}`,{method:"PATCH",body:JSON.stringify({matches})});
-      setSessions(prev=>prev.map((ss,i)=>i===idx?{...ss,matches}:ss));
-      alert("스코어가 수정됐습니다!");
-    }catch(e){alert("스코어 수정 실패.");}
   }
 
   async function saveGuestDB(g:Guest){
@@ -480,7 +493,6 @@ export default function App(){
   }
   function addQuickGuest(){
     const name=quickName.trim();if(!name)return;
-    if(MEMBERS.includes(name))return alert(`${name}은(는) 정회원입니다. 위 출석 체크에서 선택해주세요.`);
     const date=todayStr();
     const existing=guests.find(g=>g.name===name);
     if(existing){
@@ -502,38 +514,186 @@ export default function App(){
 
   function startSession(){
     if(todayPlayers.length<4)return alert("최소 4명이 필요합니다.");
-    if(todayPlayers.length>10)return alert("최대 10명까지 가능합니다.");
+    if(todayPlayers.length>6)return alert("최대 6명까지 가능합니다.");
     const allStatus:Record<string,string>={};
     presentMembers.forEach(m=>{allStatus[m]=memberStatus[m]||"";});
     todayGuests.forEach(g=>{allStatus[g]=guestStatus[g]||"";});
-    const matches=generateKDK(todayPlayers,numGames,allStatus);
-    const scoreInputs:Record<number,ScoreInput>={};
-    matches.forEach((_,i)=>{scoreInputs[i]=emptyScore();});
-    setActiveSession({date:sessionDate,players:[...todayPlayers],matches,scoreInputs,playerStatus:allStatus,numGames,note:sessionNoteInput});
+
+    const players=[...todayPlayers];
+    const {pc,oc}=initCounts(players);
+
+    // 첫 게임만 생성 (KDK로)
+    const firstMatch=generateNextMatch(players,[],{},{},allStatus,0,numGames,pc,oc);
+    const scoreInputs:Record<number,ScoreInput>={0:emptyScore()};
+
+    setActiveSession({
+      date:sessionDate,
+      players,
+      matches:[firstMatch],
+      scoreInputs,
+      playerStatus:allStatus,
+      numGames,
+      note:sessionNoteInput,
+      playHistory:[],
+      consecutiveCount:{},
+      lastRested:{},
+      partnerCount:pc,
+      opponentCount:oc,
+    });
     setPastSessionIdx(null);setTab(1);
   }
 
-  function addGame(){
+  // ─── 스코어 저장 + 다음 게임 자동 생성 ───────────────────────
+  function saveScore(idx:number){
     if(!activeSession)return;
-    const nm=generateKDK(activeSession.players,1,activeSession.playerStatus);
-    if(!nm.length)return alert("추가 가능한 대진 조합이 없습니다.");
-    const idx=activeSession.matches.length;
-    setActiveSession(prev=>prev?({...prev,matches:[...prev.matches,nm[0]],scoreInputs:{...prev.scoreInputs,[idx]:emptyScore()},numGames:prev.numGames+1}):null);
+    const s=activeSession.scoreInputs[idx]||emptyScore();
+    if(s.a===""||s.b==="")return alert("스코어를 입력해주세요.");
+
+    const isDraw=parseInt(s.a)===parseInt(s.b);
+    const m=activeSession.matches[idx];
+
+    // 실제 플레이한 사람들 (pair1 + pair2)
+    const playedNow=[...m.pair1,...m.pair2];
+    const restedNow=activeSession.players.filter(p=>{
+      const st=activeSession.playerStatus[p]||"";
+      if(st==="late"&&idx===0)return true;
+      if(st==="early"&&idx>=activeSession.numGames-2)return true;
+      return !playedNow.includes(p);
+    });
+
+    // 누적 카운트 업데이트
+    const newPc={...activeSession.partnerCount};
+    const newOc={...activeSession.opponentCount};
+    updateCounts(m.pair1,m.pair2,newPc,newOc);
+
+    // 연속 게임 횟수 업데이트
+    const newConsecutive={...activeSession.consecutiveCount};
+    activeSession.players.forEach(p=>{
+      if(playedNow.includes(p)){
+        newConsecutive[p]=(newConsecutive[p]||0)+1;
+      }else{
+        newConsecutive[p]=0; // 쉬면 리셋
+      }
+    });
+
+    // 플레이 히스토리 업데이트
+    const newRecord:PlayRecord={
+      players:playedNow,
+      pair1:[...m.pair1],
+      pair2:[...m.pair2],
+      rested:restedNow,
+    };
+    const newHistory=[...activeSession.playHistory,newRecord];
+
+    // 스코어 저장
+    const newScoreInputs={
+      ...activeSession.scoreInputs,
+      [idx]:{...s,draw:isDraw,saved:true},
+    };
+
+    // 다음 게임이 필요한지 확인 (저장된 게임 수 < numGames)
+    const savedCount=Object.values(newScoreInputs).filter(si=>si.saved).length;
+    const nextIdx=activeSession.matches.length; // 아직 생성 안 된 다음 게임 인덱스
+
+    let newMatches=[...activeSession.matches];
+    let newScoreInputsFinal={...newScoreInputs};
+
+    // 마지막으로 저장된 게임이고 아직 목표 게임 수에 안 됐으면 다음 게임 생성
+    if(idx===nextIdx-1 && savedCount<activeSession.numGames){
+      const nextMatch=generateNextMatch(
+        activeSession.players,
+        newHistory,
+        newConsecutive,
+        activeSession.lastRested,
+        activeSession.playerStatus,
+        nextIdx,
+        activeSession.numGames,
+        newPc,
+        newOc,
+      );
+      newMatches=[...newMatches,nextMatch];
+      newScoreInputsFinal={...newScoreInputsFinal,[nextIdx]:emptyScore()};
+    }
+
+    setActiveSession(prev=>prev?({
+      ...prev,
+      matches:newMatches,
+      scoreInputs:newScoreInputsFinal,
+      playHistory:newHistory,
+      consecutiveCount:newConsecutive,
+      partnerCount:newPc,
+      opponentCount:newOc,
+    }):null);
+  }
+
+  function unlockScore(idx:number){
+    if(!activeSession)return;
+    // 저장 취소 시 해당 게임 이후 생성된 게임들도 제거 (재계산 필요)
+    const newMatches=activeSession.matches.slice(0,idx+1);
+    const newScoreInputs:Record<number,ScoreInput>={};
+    for(let i=0;i<=idx;i++){
+      newScoreInputs[i]=i===idx
+        ?{...activeSession.scoreInputs[idx],saved:false}
+        :activeSession.scoreInputs[i];
+    }
+    // 히스토리도 해당 게임 이전까지만 유지
+    const newHistory=activeSession.playHistory.slice(0,idx);
+
+    // 연속 카운트 재계산
+    const newConsecutive:Record<string,number>={};
+    const newPc:Record<string,Record<string,number>>={};
+    const newOc:Record<string,Record<string,number>>={};
+    activeSession.players.forEach(p=>{
+      newPc[p]={};newOc[p]={};
+      activeSession.players.forEach(q=>{newPc[p][q]=0;newOc[p][q]=0;});
+      newConsecutive[p]=0;
+    });
+    newHistory.forEach(h=>{
+      updateCounts(h.pair1,h.pair2,newPc,newOc);
+      activeSession.players.forEach(p=>{
+        if(h.players.includes(p))newConsecutive[p]=(newConsecutive[p]||0)+1;
+        else newConsecutive[p]=0;
+      });
+    });
+
+    setActiveSession(prev=>prev?({
+      ...prev,
+      matches:newMatches,
+      scoreInputs:newScoreInputs,
+      playHistory:newHistory,
+      consecutiveCount:newConsecutive,
+      partnerCount:newPc,
+      opponentCount:newOc,
+    }):null);
   }
 
   function updateScore(idx:number,field:string,val:string|boolean){
     setActiveSession(prev=>prev?({...prev,scoreInputs:{...prev.scoreInputs,[idx]:{...prev.scoreInputs[idx],[field]:val}}}):null);
   }
-  function saveScore(idx:number){
+
+  // 수동으로 게임 추가 (목표 게임 수 초과 시)
+  function addGame(){
     if(!activeSession)return;
-    const s=activeSession.scoreInputs[idx]||emptyScore();
-    if(s.a===""||s.b==="")return alert("스코어를 입력해주세요.");
-    const isDraw=parseInt(s.a)===parseInt(s.b);
-    setActiveSession(prev=>prev?({...prev,scoreInputs:{...prev.scoreInputs,[idx]:{...prev.scoreInputs[idx],draw:isDraw,saved:true}}}):null);
+    const nextIdx=activeSession.matches.length;
+    const nextMatch=generateNextMatch(
+      activeSession.players,
+      activeSession.playHistory,
+      activeSession.consecutiveCount,
+      activeSession.lastRested,
+      activeSession.playerStatus,
+      nextIdx,
+      activeSession.numGames+1,
+      activeSession.partnerCount,
+      activeSession.opponentCount,
+    );
+    setActiveSession(prev=>prev?({
+      ...prev,
+      matches:[...prev.matches,nextMatch],
+      scoreInputs:{...prev.scoreInputs,[nextIdx]:emptyScore()},
+      numGames:prev.numGames+1,
+    }):null);
   }
-  function unlockScore(idx:number){
-    setActiveSession(prev=>prev?({...prev,scoreInputs:{...prev.scoreInputs,[idx]:{...prev.scoreInputs[idx],saved:false}}}):null);
-  }
+
   async function finalizeSession(){
     if(!activeSession)return;
     const completed=activeSession.matches.map((m,i)=>{
@@ -628,26 +788,42 @@ export default function App(){
   const savedCount=activeSession?Object.values(activeSession.scoreInputs).filter(s=>s.saved).length:0;
   const sortedGuests=[...guests].sort((a,b)=>guestTotalVisits(b.name)-guestTotalVisits(a.name));
 
-  function ParticipationSummary(){
+  // ─── 인당 실제 게임 수 표시 (playHistory 기반) ───────────────
+  function PlayerGameCount(){
     if(!activeSession)return null;
-    const{players,numGames:ng,playerStatus}=activeSession;
-    const participation=calcParticipation(players,ng,playerStatus||{});
-    const circled=["①","②","③","④","⑤","⑥","⑦","⑧","⑨","⑩"];
+    const{players,playHistory,playerStatus,matches,scoreInputs}=activeSession;
+
+    // 저장된 게임 기준 실제 참여 횟수
+    const actualCount:Record<string,number>={};
+    players.forEach(p=>{actualCount[p]=0;});
+    playHistory.forEach(h=>{h.players.forEach(p=>{actualCount[p]=(actualCount[p]||0)+1;});});
+
+    // 아직 저장 안 된 현재 게임도 표시 (진행 중인 게임)
+    const currentGameIdx=matches.length-1;
+    const currentScore=scoreInputs[currentGameIdx];
+    const currentPlaying=!currentScore?.saved
+      ?[...matches[currentGameIdx].pair1,...matches[currentGameIdx].pair2]
+      :[];
+
     return(
       <div style={{background:"#fff",border:"1px solid #E5E7EB",borderRadius:12,padding:"12px 16px",marginBottom:14}}>
-        <p style={{margin:"0 0 10px",fontSize:13,fontWeight:600,color:"#111"}}>📋 인원별 참여 게임</p>
-        <div style={{display:"grid",gap:6}}>
+        <p style={{margin:"0 0 10px",fontSize:13,fontWeight:600,color:"#111"}}>📊 인당 게임 참여 현황</p>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:6}}>
           {players.map(p=>{
-            const st=playerStatus?.[p]||"";const participates=participation[p]||[];
-            return(<div key={p} style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
-              <span style={{fontSize:13,fontWeight:500,color:"#111",minWidth:52}}>{p}</span>
-              {st==="late"&&<span style={{fontSize:10,background:C.amberL,color:C.amberD,padding:"1px 5px",borderRadius:4}}>늦참</span>}
-              {st==="early"&&<span style={{fontSize:10,background:C.pinkL,color:C.pinkD,padding:"1px 5px",borderRadius:4}}>일퇴</span>}
-              <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
-                {Array.from({length:ng},(_,i)=>{const plays=participates.includes(i);return(<span key={i} style={{fontSize:16,color:plays?C.teal:"#D1D5DB",fontWeight:plays?600:400,opacity:plays?1:0.5}}>{circled[i]||i+1}</span>);})}
+            const st=playerStatus[p]||"";
+            const isPlaying=currentPlaying.includes(p);
+            const count=actualCount[p]||0;
+            return(
+              <div key={p} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"6px 10px",borderRadius:8,background:isPlaying?C.tealL:C.grayL,border:isPlaying?`1px solid ${C.teal}`:"1px solid transparent"}}>
+                <div style={{display:"flex",alignItems:"center",gap:6}}>
+                  <span style={{fontSize:13,fontWeight:500,color:isPlaying?C.tealD:"#111"}}>{p}</span>
+                  {st==="late"&&<span style={{fontSize:10,background:C.amberL,color:C.amberD,padding:"1px 5px",borderRadius:4}}>늦참</span>}
+                  {st==="early"&&<span style={{fontSize:10,background:C.pinkL,color:C.pinkD,padding:"1px 5px",borderRadius:4}}>일퇴</span>}
+                  {isPlaying&&<span style={{fontSize:10,background:C.teal,color:"#fff",padding:"1px 5px",borderRadius:4}}>진행중</span>}
+                </div>
+                <span style={{fontSize:16,fontWeight:700,color:isPlaying?C.teal:C.grayD}}>{count}게임</span>
               </div>
-              <span style={{fontSize:11,color:C.gray,marginLeft:"auto"}}>{participates.length}게임</span>
-            </div>);
+            );
           })}
         </div>
       </div>
@@ -679,7 +855,7 @@ export default function App(){
   if(pastSessionIdx!==null&&tab===1){
     const s=sessions[pastSessionIdx];
     if(!s){setPastSessionIdx(null);return null;}
-    return(<PastSessionDetail session={s} onBack={()=>setPastSessionIdx(null)} onDelete={()=>deleteSessionDB(pastSessionIdx)} onSaveNote={note=>updateSessionNote(pastSessionIdx,note)} onSaveScores={matches=>updateSessionScores(pastSessionIdx,matches)}/>);
+    return(<PastSessionDetail session={s} onBack={()=>setPastSessionIdx(null)} onDelete={()=>deleteSessionDB(pastSessionIdx)} onSaveNote={note=>updateSessionNote(pastSessionIdx,note)}/>);
   }
 
   if(profilePlayer){
@@ -799,15 +975,8 @@ export default function App(){
             <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
               <span style={{fontSize:24}}>🎾</span>
               <h1 style={{margin:0,fontSize:22,fontWeight:600,color:"#fff"}}>{config.clubName}</h1>
-              {/* 실시간 동기화 상태 표시 */}
-              {realtimeConnected
-                ? <span style={{fontSize:11,background:"rgba(22,163,74,0.4)",color:"#fff",padding:"2px 8px",borderRadius:10,display:"flex",alignItems:"center",gap:4}}>
-                    <span style={{width:6,height:6,borderRadius:"50%",background:"#86efac",display:"inline-block"}}/>실시간
-                  </span>
-                : <span style={{fontSize:11,background:"rgba(255,255,255,0.2)",color:"rgba(255,255,255,0.7)",padding:"2px 8px",borderRadius:10}}>연결 중...</span>
-              }
-              {syncStatus==="syncing"&&<span style={{fontSize:11,background:"rgba(255,255,255,0.25)",color:"#fff",padding:"2px 8px",borderRadius:10}}>저장 중...</span>}
-              {syncStatus==="error"&&<span style={{fontSize:11,background:"rgba(232,93,58,0.5)",color:"#fff",padding:"2px 8px",borderRadius:10}}>⚠️ 오류</span>}
+              {syncStatus==="syncing"&&<span style={{fontSize:11,background:"rgba(255,255,255,0.25)",color:"#fff",padding:"2px 8px",borderRadius:10}}>동기화 중...</span>}
+              {syncStatus==="error"&&<span style={{fontSize:11,background:"rgba(232,93,58,0.5)",color:"#fff",padding:"2px 8px",borderRadius:10}}>⚠️ 동기화 오류</span>}
             </div>
             <p style={{margin:0,fontSize:12,color:"rgba(255,255,255,0.85)",lineHeight:1.6}} dangerouslySetInnerHTML={{__html:config.clubSubtitle}}/>
           </div>
@@ -903,19 +1072,19 @@ export default function App(){
                   </div>
                   <div>
                     <p style={{margin:"0 0 6px",fontSize:13,color:C.gray}}>참가 인원</p>
-                    <p style={{margin:0,fontSize:14,fontWeight:500,color:todayPlayers.length>=4&&todayPlayers.length<=10?C.teal:C.coral}}>{todayPlayers.length}명 {todayPlayers.length>=4&&todayPlayers.length<=10?"✓":"⚠️"}</p>
+                    <p style={{margin:0,fontSize:14,fontWeight:500,color:todayPlayers.length>=4&&todayPlayers.length<=6?C.teal:C.coral}}>{todayPlayers.length}명 {todayPlayers.length>=4&&todayPlayers.length<=6?"✓":"⚠️"}</p>
                   </div>
                 </div>
                 <div style={{marginBottom:14}}>
                   <p style={{margin:"0 0 6px",fontSize:13,color:C.gray}}>📝 세션 메모</p>
                   <textarea value={sessionNoteInput} onChange={e=>setSessionNoteInput(e.target.value)} placeholder="날씨, 코트 상태 등..." rows={2} style={{width:"100%",fontSize:13,padding:"8px 12px",borderRadius:8,border:"1px solid #D1D5DB",outline:"none",resize:"vertical",fontFamily:"inherit",boxSizing:"border-box"}}/>
                 </div>
-                {todayPlayers.length>=4&&todayPlayers.length<=10&&(
+                {todayPlayers.length>=4&&todayPlayers.length<=6&&(
                   <div style={{background:C.tealL,borderRadius:8,padding:"8px 12px",marginBottom:12,fontSize:12,color:C.tealD}}>오늘 참가자: {todayPlayers.join(", ")}</div>
                 )}
-                <button onClick={startSession} disabled={todayPlayers.length<4||todayPlayers.length>10} style={{padding:"10px 22px",borderRadius:8,fontSize:14,cursor:todayPlayers.length>=4&&todayPlayers.length<=10?"pointer":"not-allowed",background:todayPlayers.length>=4&&todayPlayers.length<=10?C.teal:"#E5E7EB",color:todayPlayers.length>=4&&todayPlayers.length<=10?"#fff":C.gray,border:"none",fontWeight:500}}>🎾 대진표 생성</button>
+                <button onClick={startSession} disabled={todayPlayers.length<4||todayPlayers.length>6} style={{padding:"10px 22px",borderRadius:8,fontSize:14,cursor:todayPlayers.length>=4?"pointer":"not-allowed",background:todayPlayers.length>=4&&todayPlayers.length<=6?C.teal:"#E5E7EB",color:todayPlayers.length>=4&&todayPlayers.length<=6?"#fff":C.gray,border:"none",fontWeight:500}}>🎾 1게임 대진 생성</button>
                 {todayPlayers.length<4&&<p style={{margin:"8px 0 0",fontSize:12,color:C.coral}}>최소 4명 이상 선택해주세요.</p>}
-                {todayPlayers.length>10&&<p style={{margin:"8px 0 0",fontSize:12,color:C.coral}}>최대 10명까지 가능합니다.</p>}
+                <p style={{margin:"8px 0 0",fontSize:11,color:C.gray}}>💡 1게임 스코어 저장 후 다음 게임이 자동 생성됩니다</p>
               </div>
             </div>
           </div>
@@ -927,37 +1096,28 @@ export default function App(){
               <div style={{borderRadius:12,overflow:"hidden",border:"1px solid #E5E7EB",marginBottom:14}}>
                 <div style={{background:C.gray,padding:"10px 16px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                   <span style={{fontSize:14,fontWeight:500,color:"#fff"}}>📂 지난 대진표</span>
-                  <div style={{display:"flex",alignItems:"center",gap:8}}>
-                    <span style={{fontSize:12,color:"rgba(255,255,255,0.7)"}}>총 {sessions.length}회</span>
-                    {activeSession&&(
-                      <button onClick={()=>setShowPastSessions(p=>!p)} style={{fontSize:11,padding:"3px 10px",borderRadius:8,border:"1px solid rgba(255,255,255,0.4)",background:"rgba(255,255,255,0.15)",color:"#fff",cursor:"pointer"}}>
-                        {showPastSessions?"접기 ▲":"더보기 ▼"}
-                      </button>
-                    )}
-                  </div>
+                  <span style={{fontSize:12,color:"rgba(255,255,255,0.7)"}}>총 {sessions.length}회</span>
                 </div>
-                {(!activeSession||showPastSessions)&&(
-                  <div style={{background:"#fff",padding:"10px 16px",display:"grid",gap:6}}>
-                    {[...sessions].reverse().map((s,i)=>{
-                      const realIdx=sessions.length-1-i;
-                      return(
-                        <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 12px",borderRadius:8,border:"1px solid #E5E7EB"}}>
-                          <button onClick={()=>setPastSessionIdx(realIdx)} style={{flex:1,display:"flex",flexDirection:"column",gap:2,background:"none",border:"none",cursor:"pointer",textAlign:"left",padding:0}}>
-                            <div style={{display:"flex",alignItems:"center",gap:8}}>
-                              <span style={{fontSize:13,fontWeight:500,color:"#111"}}>{s.date}</span>
-                              <span style={{fontSize:11,color:C.gray}}>{s.players.join(", ")}</span>
-                            </div>
-                            {s.note&&<span style={{fontSize:11,color:C.tealD,background:C.tealL,padding:"1px 6px",borderRadius:4}}>📝 {s.note.slice(0,30)}{s.note.length>30?"...":""}</span>}
-                          </button>
-                          <div style={{display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
-                            <span style={{fontSize:12,color:C.teal,fontWeight:500}}>{s.matches.length}게임</span>
-                            <button onClick={()=>deleteSessionDB(realIdx)} style={{fontSize:11,padding:"3px 8px",borderRadius:6,border:"1px solid #FECACA",background:"#FEF2F2",color:C.coral,cursor:"pointer"}}>삭제</button>
+                <div style={{background:"#fff",padding:"10px 16px",display:"grid",gap:6}}>
+                  {[...sessions].reverse().map((s,i)=>{
+                    const realIdx=sessions.length-1-i;
+                    return(
+                      <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 12px",borderRadius:8,border:"1px solid #E5E7EB"}}>
+                        <button onClick={()=>setPastSessionIdx(realIdx)} style={{flex:1,display:"flex",flexDirection:"column",gap:2,background:"none",border:"none",cursor:"pointer",textAlign:"left",padding:0}}>
+                          <div style={{display:"flex",alignItems:"center",gap:8}}>
+                            <span style={{fontSize:13,fontWeight:500,color:"#111"}}>{s.date}</span>
+                            <span style={{fontSize:11,color:C.gray}}>{s.players.join(", ")}</span>
                           </div>
+                          {s.note&&<span style={{fontSize:11,color:C.tealD,background:C.tealL,padding:"1px 6px",borderRadius:4}}>📝 {s.note.slice(0,30)}{s.note.length>30?"...":""}</span>}
+                        </button>
+                        <div style={{display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
+                          <span style={{fontSize:12,color:C.teal,fontWeight:500}}>{s.matches.length}게임</span>
+                          <button onClick={()=>deleteSessionDB(realIdx)} style={{fontSize:11,padding:"3px 8px",borderRadius:6,border:"1px solid #FECACA",background:"#FEF2F2",color:C.coral,cursor:"pointer"}}>삭제</button>
                         </div>
-                      );
-                    })}
-                  </div>
-                )}
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
             )}
             {!activeSession?(
@@ -969,13 +1129,19 @@ export default function App(){
               <>
                 <div style={{background:C.tealL,border:`1px solid ${C.teal}`,borderRadius:12,padding:"12px 16px",marginBottom:14,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                   <div>
-                    <p style={{margin:0,fontSize:14,fontWeight:500,color:C.tealD}}>KDK 대진표 · {activeSession.date}</p>
+                    <p style={{margin:0,fontSize:14,fontWeight:500,color:C.tealD}}>대진표 · {activeSession.date}</p>
                     <p style={{margin:"2px 0 0",fontSize:12,color:C.teal}}>참가: {activeSession.players.join(", ")}</p>
                     {activeSession.note&&<p style={{margin:"4px 0 0",fontSize:11,color:C.tealD}}>📝 {activeSession.note}</p>}
                   </div>
-                  <span style={{fontSize:13,fontWeight:500,color:C.tealD}}>{savedCount}/{activeSession.matches.length} 완료</span>
+                  <div style={{textAlign:"right"}}>
+                    <span style={{fontSize:13,fontWeight:500,color:C.tealD}}>{savedCount}/{activeSession.numGames} 완료</span>
+                    <p style={{margin:"2px 0 0",fontSize:11,color:C.teal}}>스코어 저장 시 다음 게임 자동 생성</p>
+                  </div>
                 </div>
-                <ParticipationSummary/>
+
+                {/* 인당 게임 수 현황 */}
+                <PlayerGameCount/>
+
                 <div style={{display:"grid",gap:10,marginBottom:14}}>
                   {activeSession.matches.map((m,i)=>{
                     const s=activeSession.scoreInputs[i]||emptyScore();
@@ -983,10 +1149,29 @@ export default function App(){
                     const pairOpts:string[][]=[];
                     for(let a=0;a<pl.length;a++)for(let b=a+1;b<pl.length;b++)pairOpts.push([pl[a],pl[b]]);
                     const drawNow=s.a!==""&&s.b!==""&&parseInt(s.a)===parseInt(s.b);
+
+                    // 이 게임에서 쉬는 사람
+                    const playingNow=[...m.pair1,...m.pair2];
+                    const restingNow=pl.filter(p=>{
+                      const st=activeSession.playerStatus[p]||"";
+                      if(st==="late"&&i===0)return true;
+                      if(st==="early"&&i>=activeSession.numGames-2)return true;
+                      return !playingNow.includes(p);
+                    });
+
+                    // 마지막 게임이고 아직 저장 안 됨 = 현재 진행 게임
+                    const isCurrentGame=i===activeSession.matches.length-1&&!s.saved;
+
                     return(
-                      <div key={i} style={{background:"#fff",border:`1px solid ${s.saved?(s.draw?C.amber:C.teal):"#E5E7EB"}`,borderRadius:12,padding:"14px 16px"}}>
+                      <div key={i} style={{background:"#fff",border:`2px solid ${s.saved?(s.draw?C.amber:C.teal):isCurrentGame?C.purple:"#E5E7EB"}`,borderRadius:12,padding:"14px 16px"}}>
                         <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}>
-                          <span style={{fontSize:12,fontWeight:500,color:C.gray,background:C.grayL,padding:"2px 8px",borderRadius:10}}>게임 {i+1}</span>
+                          <div style={{display:"flex",alignItems:"center",gap:6}}>
+                            <span style={{fontSize:12,fontWeight:500,color:C.gray,background:C.grayL,padding:"2px 8px",borderRadius:10}}>게임 {i+1}</span>
+                            {isCurrentGame&&<span style={{fontSize:11,background:C.purpleL,color:C.purpleD,padding:"2px 8px",borderRadius:10,fontWeight:500}}>진행 중</span>}
+                            {restingNow.length>0&&!s.saved&&(
+                              <span style={{fontSize:11,color:C.gray}}>대기: {restingNow.join(", ")}</span>
+                            )}
+                          </div>
                           {s.saved&&(
                             <div style={{display:"flex",alignItems:"center",gap:8}}>
                               {s.draw?<span style={{fontSize:12,color:C.amberD,fontWeight:500}}>🤝 무승부 {s.a}:{s.b}</span>:<span style={{fontSize:12,color:C.tealD,fontWeight:500}}>✓ {s.a}:{s.b}</span>}
@@ -1005,13 +1190,13 @@ export default function App(){
                         </div>
                         {!s.saved?(
                           <>
-                            <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:16,marginBottom:10}}>
-                              <input type="number" min="0" max="99" placeholder="A" value={s.a} onChange={e=>updateScore(i,"a",e.target.value)} style={{width:80,fontSize:32,padding:"10px",borderRadius:10,border:`2px solid ${drawNow?C.amber:C.teal}`,outline:"none",textAlign:"center",fontWeight:700}}/>
-                              <span style={{fontSize:drawNow?24:18,color:drawNow?C.amber:C.gray,fontWeight:700}}>{drawNow?"🤝":":"}</span>
-                              <input type="number" min="0" max="99" placeholder="B" value={s.b} onChange={e=>updateScore(i,"b",e.target.value)} style={{width:80,fontSize:32,padding:"10px",borderRadius:10,border:`2px solid ${drawNow?C.amber:C.coral}`,outline:"none",textAlign:"center",fontWeight:700}}/>
+                            <div style={{display:"flex",alignItems:"center",gap:8}}>
+                              <input type="number" min="0" max="99" placeholder="A" value={s.a} onChange={e=>updateScore(i,"a",e.target.value)} style={{width:64,fontSize:24,padding:"8px",borderRadius:8,border:`1.5px solid ${drawNow?C.amber:C.teal}`,outline:"none",textAlign:"center",fontWeight:700}}/>
+                              <span style={{fontSize:drawNow?20:14,color:drawNow?C.amber:C.gray}}>{drawNow?"🤝":":"}</span>
+                              <input type="number" min="0" max="99" placeholder="B" value={s.b} onChange={e=>updateScore(i,"b",e.target.value)} style={{width:64,fontSize:24,padding:"8px",borderRadius:8,border:`1.5px solid ${drawNow?C.amber:C.coral}`,outline:"none",textAlign:"center",fontWeight:700}}/>
+                              <button onClick={()=>saveScore(i)} style={{flex:1,padding:"10px",borderRadius:8,fontSize:14,cursor:"pointer",background:drawNow?C.amber:C.purple,color:"#fff",border:"none",fontWeight:600}}>저장 + 다음 생성</button>
                             </div>
-                            {drawNow&&<p style={{margin:"0 0 8px",fontSize:11,color:C.amberD,textAlign:"center"}}>🤝 동점 — 저장 시 무승부로 처리됩니다</p>}
-                            <button onClick={()=>saveScore(i)} style={{width:"100%",padding:"12px",borderRadius:8,fontSize:15,cursor:"pointer",background:drawNow?C.amber:C.teal,color:"#fff",border:"none",fontWeight:600}}>저장</button>
+                            {drawNow&&<p style={{margin:"6px 0 0",fontSize:11,color:C.amberD,textAlign:"center"}}>🤝 동점 — 저장 시 무승부로 처리됩니다</p>}
                           </>
                         ):(
                           <div style={{display:"flex",gap:8}}>
@@ -1249,14 +1434,6 @@ export default function App(){
                   <button onClick={exportJson} style={{padding:"9px 16px",borderRadius:8,fontSize:13,cursor:"pointer",background:C.blueL,color:C.blueD,border:`1px solid ${C.blue}`,fontWeight:500}}>💾 JSON 백업</button>
                   <button onClick={exportXlsx} disabled={!xlsxReady} style={{padding:"9px 16px",borderRadius:8,fontSize:13,cursor:xlsxReady?"pointer":"not-allowed",background:C.greenL,color:C.greenD,border:`1px solid ${C.green}`,fontWeight:500}}>📊 엑셀 내보내기</button>
                   <button onClick={loadAll} style={{padding:"9px 16px",borderRadius:8,fontSize:13,cursor:"pointer",background:C.tealL,color:C.tealD,border:`1px solid ${C.teal}`,fontWeight:500}}>🔄 데이터 새로고침</button>
-                </div>
-                {/* 실시간 연결 상태 */}
-                <div style={{background:realtimeConnected?C.greenL:C.amberL,borderRadius:8,padding:"10px 14px",display:"flex",alignItems:"center",gap:8}}>
-                  <span style={{fontSize:18}}>{realtimeConnected?"🟢":"🟡"}</span>
-                  <div>
-                    <p style={{margin:0,fontSize:13,fontWeight:500,color:realtimeConnected?C.greenD:C.amberD}}>실시간 동기화 {realtimeConnected?"연결됨":"연결 중..."}</p>
-                    <p style={{margin:"2px 0 0",fontSize:11,color:realtimeConnected?C.green:C.amber}}>{realtimeConnected?"다른 회원의 변경사항이 자동으로 반영됩니다":"잠시 후 자동으로 연결됩니다"}</p>
-                  </div>
                 </div>
               </div>
             </div>

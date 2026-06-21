@@ -99,16 +99,13 @@ function generateNextMatch(
   opponentCount: Record<string,Record<string,number>>,
   usedMatchKeys?: Set<string>,
 ): Match {
-  const n = allPlayers.length;
-
-  // 늦참: 첫 게임(gameIndex===0) 제외
-  // 일퇴: 마지막 2게임(gameIndex >= numGames-2) 제외
-  const available = allPlayers.filter(p => {
+  // ★ 중복 제거: available 배열에 같은 이름이 두 번 들어오는 경우 원천 차단
+  const available = [...new Set(allPlayers.filter(p => {
     const st = playerStatus[p] || "";
     if (st === "late" && gameIndex === 0) return false;
     if (st === "early" && gameIndex >= numGames - 2) return false;
     return true;
-  });
+  }))];
 
   let selected: string[] = [];
 
@@ -119,12 +116,14 @@ function generateNextMatch(
     // 5명: 1명 대기
     selected = selectFivePlayers(available, playHistory, consecutiveCount, lastRested, gameIndex);
   } else {
-    // 6명: 2명 대기
+    // 6명 이상: 4명 선발, 나머지 대기
     selected = selectSixPlayers(available, playHistory, consecutiveCount, lastRested, gameIndex);
   }
 
+  // 최종 중복 제거 (방어 코드)
+  const uniqueSelected = [...new Set(selected)].slice(0, 4);
   // 4명 확정 후 KDK 페어 최적화 (이미 나온 완전 동일 대진은 회피)
-  return bestPair(selected, partnerCount, opponentCount, usedMatchKeys);
+  return bestPair(uniqueSelected, partnerCount, opponentCount, usedMatchKeys);
 }
 
 function selectFivePlayers(
@@ -323,7 +322,7 @@ function updateCounts(
 // fixedMatches: 이미 확정된(또는 사용자가 수기로 지정한) 앞부분 대진들.
 // fixedMatches.length 부터 numGames-1 까지는 중복 페어/중복 대진을 피하며 자동 생성.
 function buildSchedule(
-  players: string[],
+  rawPlayers: string[],
   playerStatus: Record<string,string>,
   numGames: number,
   fixedMatches: Match[],
@@ -334,6 +333,9 @@ function buildSchedule(
   pc: Record<string,Record<string,number>>;
   oc: Record<string,Record<string,number>>;
 } {
+  // ★ 가장 먼저 players 중복 제거 — 이게 모든 버그의 근원 차단
+  const players = [...new Set(rawPlayers)];
+
   const { pc, oc } = initCounts(players);
   const consecutive: Record<string,number> = {};
   players.forEach(p => consecutive[p] = 0);
@@ -343,9 +345,12 @@ function buildSchedule(
 
   function applyMatch(m: Match, idx: number) {
     matches.push(m);
-    updateCounts(m.pair1, m.pair2, pc, oc);
-    usedMatchKeys.add(matchKey(m));
-    const played = [...m.pair1, ...m.pair2];
+    // 유효한 대진만 카운트에 반영 (유효하지 않으면 표시만 유지)
+    if (isValidMatch(m)) {
+      updateCounts(m.pair1, m.pair2, pc, oc);
+      usedMatchKeys.add(matchKey(m));
+    }
+    const played = [...new Set([...m.pair1, ...m.pair2])]; // 중복 제거
     players.forEach(p => {
       if (played.includes(p)) consecutive[p] = (consecutive[p]||0) + 1;
       else consecutive[p] = 0;
@@ -361,8 +366,7 @@ function buildSchedule(
 
   // 고정된(이미 결정된) 앞부분 대진 그대로 적용
   fixedMatches.forEach((m, idx) => {
-    if (isValidMatch(m)) applyMatch(m, idx);
-    else applyMatch(m, idx); // 유효하지 않아도 표시는 유지(별도 UI 경고로 처리), 카운트만 최선으로 반영
+    applyMatch(m, idx);
   });
 
   // 나머지 게임 자동 생성 (중복 회피)

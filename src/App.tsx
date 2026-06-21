@@ -41,6 +41,14 @@ const C = {
 };
 
 function pairKey(p: string[]){return[...p].sort().join(" & ");}
+// 매치(페어 vs 페어) 고유키 - 순서 무관 (동일 대진 중복 감지용)
+function matchKey(m: {pair1:string[];pair2:string[]}){return[pairKey(m.pair1),pairKey(m.pair2)].sort().join(" || ");}
+// 대진 유효성 검사: 양 팀 합쳐 4명이 모두 달라야 함 (한 사람이 양쪽 팀에 동시에 있으면 안 됨)
+function isValidMatch(m:{pair1:string[];pair2:string[]}):boolean{
+  if(m.pair1.length!==2||m.pair2.length!==2)return false;
+  const all=[...m.pair1,...m.pair2];
+  return new Set(all).size===4;
+}
 function todayStr(){const d=new Date();return`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;}
 function monthStr(d?: string){return d?.slice(0,7)||"";}
 
@@ -89,6 +97,7 @@ function generateNextMatch(
   numGames: number,
   partnerCount: Record<string,Record<string,number>>,
   opponentCount: Record<string,Record<string,number>>,
+  usedMatchKeys?: Set<string>,
 ): Match {
   const n = allPlayers.length;
 
@@ -114,8 +123,8 @@ function generateNextMatch(
     selected = selectSixPlayers(available, playHistory, consecutiveCount, lastRested, gameIndex);
   }
 
-  // 4명 확정 후 KDK 페어 최적화
-  return bestPair(selected, partnerCount, opponentCount);
+  // 4명 확정 후 KDK 페어 최적화 (이미 나온 완전 동일 대진은 회피)
+  return bestPair(selected, partnerCount, opponentCount, usedMatchKeys);
 }
 
 function selectFivePlayers(
@@ -189,6 +198,7 @@ function bestPair(
   players: string[],
   partnerCount: Record<string,Record<string,number>>,
   opponentCount: Record<string,Record<string,number>>,
+  usedMatchKeys?: Set<string>,
 ): Match {
   if (players.length < 4) {
     // 예외 처리
@@ -209,7 +219,7 @@ function bestPair(
   combos.forEach(m => {
     const [p1a, p1b] = m.pair1;
     const [p2a, p2b] = m.pair2;
-    const score =
+    let score =
       (partnerCount[p1a]?.[p1b] || 0) +
       (partnerCount[p1b]?.[p1a] || 0) +
       (partnerCount[p2a]?.[p2b] || 0) +
@@ -218,6 +228,8 @@ function bestPair(
       (opponentCount[p1a]?.[p2b] || 0) +
       (opponentCount[p1b]?.[p2a] || 0) +
       (opponentCount[p1b]?.[p2b] || 0);
+    // 완전히 동일한 대진(페어 vs 페어)이 이미 나온 적 있으면 강하게 회피
+    if (usedMatchKeys?.has(matchKey(m))) score += 1000;
     if (score < bestScore) {
       bestScore = score;
       bestCombo = m;
@@ -294,7 +306,65 @@ function updateCounts(
   }));
 }
 
-function calcParticipation(players:string[],numGames:number,playerStatus:Record<string,string>={}){
+// ─── 전체/부분 대진 스케줄 생성 ─────────────────────────────────
+// fixedMatches: 이미 확정된(또는 사용자가 수기로 지정한) 앞부분 대진들.
+// fixedMatches.length 부터 numGames-1 까지는 중복 페어/중복 대진을 피하며 자동 생성.
+function buildSchedule(
+  players: string[],
+  playerStatus: Record<string,string>,
+  numGames: number,
+  fixedMatches: Match[],
+): {
+  matches: Match[];
+  history: PlayRecord[];
+  consecutive: Record<string,number>;
+  pc: Record<string,Record<string,number>>;
+  oc: Record<string,Record<string,number>>;
+} {
+  const { pc, oc } = initCounts(players);
+  const consecutive: Record<string,number> = {};
+  players.forEach(p => consecutive[p] = 0);
+  const history: PlayRecord[] = [];
+  const usedMatchKeys = new Set<string>();
+  const matches: Match[] = [];
+
+  function applyMatch(m: Match, idx: number) {
+    matches.push(m);
+    updateCounts(m.pair1, m.pair2, pc, oc);
+    usedMatchKeys.add(matchKey(m));
+    const played = [...m.pair1, ...m.pair2];
+    players.forEach(p => {
+      if (played.includes(p)) consecutive[p] = (consecutive[p]||0) + 1;
+      else consecutive[p] = 0;
+    });
+    const rested = players.filter(p => {
+      const st = playerStatus[p] || "";
+      if (st === "late" && idx === 0) return true;
+      if (st === "early" && idx >= numGames - 2) return true;
+      return !played.includes(p);
+    });
+    history.push({ players: played, pair1: [...m.pair1], pair2: [...m.pair2], rested });
+  }
+
+  // 고정된(이미 결정된) 앞부분 대진 그대로 적용
+  fixedMatches.forEach((m, idx) => {
+    if (isValidMatch(m)) applyMatch(m, idx);
+    else applyMatch(m, idx); // 유효하지 않아도 표시는 유지(별도 UI 경고로 처리), 카운트만 최선으로 반영
+  });
+
+  // 나머지 게임 자동 생성 (중복 회피)
+  for (let gi = fixedMatches.length; gi < numGames; gi++) {
+    const nextMatch = generateNextMatch(
+      players, history, consecutive, {}, playerStatus,
+      gi, numGames, pc, oc, usedMatchKeys,
+    );
+    applyMatch(nextMatch, gi);
+  }
+
+  return { matches, history, consecutive, pc, oc };
+}
+
+
   const result:Record<string,number[]>={};
   players.forEach(p=>{result[p]=[];for(let i=0;i<numGames;i++){const st=playerStatus[p]||"";if(st==="late"&&i===0)continue;if(st==="early"&&i>=numGames-2)continue;result[p].push(i);}});
   return result;
@@ -382,6 +452,7 @@ export default function App(){
   const[editingMemberVal,setEditingMemberVal]=useState("");
   const[pwaInstallPrompt,setPwaInstallPrompt]=useState<any>(null);
   const[showPwaBtn,setShowPwaBtn]=useState(false);
+  const[showAllPastSessions,setShowAllPastSessions]=useState(false);
   const[sessionNoteInput,setSessionNoteInput]=useState("");
   const jsonRef=useRef<HTMLInputElement>(null);
 
@@ -520,150 +591,80 @@ export default function App(){
     todayGuests.forEach(g=>{allStatus[g]=guestStatus[g]||"";});
 
     const players=[...todayPlayers];
-    const {pc,oc}=initCounts(players);
 
-    // 첫 게임만 생성 (KDK로)
-    const firstMatch=generateNextMatch(players,[],{},{},allStatus,0,numGames,pc,oc);
-    const scoreInputs:Record<number,ScoreInput>={0:emptyScore()};
+    // 설정한 게임 수만큼 KDK 기준으로 전체 대진을 한번에 생성
+    const sched=buildSchedule(players,allStatus,numGames,[]);
+    const scoreInputs:Record<number,ScoreInput>={};
+    sched.matches.forEach((_,i)=>{scoreInputs[i]=emptyScore();});
 
     setActiveSession({
       date:sessionDate,
       players,
-      matches:[firstMatch],
+      matches:sched.matches,
       scoreInputs,
       playerStatus:allStatus,
       numGames,
       note:sessionNoteInput,
-      playHistory:[],
-      consecutiveCount:{},
+      playHistory:sched.history,
+      consecutiveCount:sched.consecutive,
       lastRested:{},
-      partnerCount:pc,
-      opponentCount:oc,
+      partnerCount:sched.pc,
+      opponentCount:sched.oc,
     });
     setPastSessionIdx(null);setTab(1);
   }
 
-  // ─── 스코어 저장 + 다음 게임 자동 생성 ───────────────────────
+  // 특정 게임의 페어를 수기로 변경 → 이후(다음) 게임들은 중복 없는 페어로 즉시 재계산
+  function updateMatchPair(i:number, side:"pair1"|"pair2", pair:string[]){
+    if(!activeSession)return;
+    const edited:Match={...activeSession.matches[i],[side]:pair};
+    if(!isValidMatch(edited)){
+      alert("⚠️ 같은 사람이 두 팀에 동시에 포함될 수 없습니다. 다른 인원을 선택해주세요.");
+      return;
+    }
+    // i번째까지(수정한 게임 포함)는 고정, 그 이후는 중복 없는 페어로 재계산
+    const fixed=[...activeSession.matches.slice(0,i),edited];
+    const sched=buildSchedule(activeSession.players,activeSession.playerStatus,activeSession.numGames,fixed);
+    setActiveSession(prev=>{
+      if(!prev)return null;
+      const scoreInputs:Record<number,ScoreInput>={};
+      sched.matches.forEach((_,idx)=>{
+        scoreInputs[idx]=idx<=i?(prev.scoreInputs[idx]||emptyScore()):emptyScore();
+      });
+      return{
+        ...prev,
+        matches:sched.matches,
+        scoreInputs,
+        playHistory:sched.history,
+        consecutiveCount:sched.consecutive,
+        partnerCount:sched.pc,
+        opponentCount:sched.oc,
+      };
+    });
+  }
+
+  // ─── 스코어 저장(대진은 이미 확정되어 있으므로 결과만 잠금) ───
   function saveScore(idx:number){
     if(!activeSession)return;
     const s=activeSession.scoreInputs[idx]||emptyScore();
     if(s.a===""||s.b==="")return alert("스코어를 입력해주세요.");
-
-    const isDraw=parseInt(s.a)===parseInt(s.b);
     const m=activeSession.matches[idx];
-
-    // 실제 플레이한 사람들 (pair1 + pair2)
-    const playedNow=[...m.pair1,...m.pair2];
-    const restedNow=activeSession.players.filter(p=>{
-      const st=activeSession.playerStatus[p]||"";
-      if(st==="late"&&idx===0)return true;
-      if(st==="early"&&idx>=activeSession.numGames-2)return true;
-      return !playedNow.includes(p);
-    });
-
-    // 누적 카운트 업데이트
-    const newPc={...activeSession.partnerCount};
-    const newOc={...activeSession.opponentCount};
-    updateCounts(m.pair1,m.pair2,newPc,newOc);
-
-    // 연속 게임 횟수 업데이트
-    const newConsecutive={...activeSession.consecutiveCount};
-    activeSession.players.forEach(p=>{
-      if(playedNow.includes(p)){
-        newConsecutive[p]=(newConsecutive[p]||0)+1;
-      }else{
-        newConsecutive[p]=0; // 쉬면 리셋
-      }
-    });
-
-    // 플레이 히스토리 업데이트
-    const newRecord:PlayRecord={
-      players:playedNow,
-      pair1:[...m.pair1],
-      pair2:[...m.pair2],
-      rested:restedNow,
-    };
-    const newHistory=[...activeSession.playHistory,newRecord];
-
-    // 스코어 저장
-    const newScoreInputs={
-      ...activeSession.scoreInputs,
-      [idx]:{...s,draw:isDraw,saved:true},
-    };
-
-    // 다음 게임이 필요한지 확인 (저장된 게임 수 < numGames)
-    const savedCount=Object.values(newScoreInputs).filter(si=>si.saved).length;
-    const nextIdx=activeSession.matches.length; // 아직 생성 안 된 다음 게임 인덱스
-
-    let newMatches=[...activeSession.matches];
-    let newScoreInputsFinal={...newScoreInputs};
-
-    // 마지막으로 저장된 게임이고 아직 목표 게임 수에 안 됐으면 다음 게임 생성
-    if(idx===nextIdx-1 && savedCount<activeSession.numGames){
-      const nextMatch=generateNextMatch(
-        activeSession.players,
-        newHistory,
-        newConsecutive,
-        activeSession.lastRested,
-        activeSession.playerStatus,
-        nextIdx,
-        activeSession.numGames,
-        newPc,
-        newOc,
-      );
-      newMatches=[...newMatches,nextMatch];
-      newScoreInputsFinal={...newScoreInputsFinal,[nextIdx]:emptyScore()};
+    if(!isValidMatch(m)){
+      alert("⚠️ 대진 오류: 같은 사람이 두 팀에 포함되어 있습니다. 저장 전에 대진을 다시 선택해주세요.");
+      return;
     }
-
+    const isDraw=parseInt(s.a)===parseInt(s.b);
     setActiveSession(prev=>prev?({
       ...prev,
-      matches:newMatches,
-      scoreInputs:newScoreInputsFinal,
-      playHistory:newHistory,
-      consecutiveCount:newConsecutive,
-      partnerCount:newPc,
-      opponentCount:newOc,
+      scoreInputs:{...prev.scoreInputs,[idx]:{...s,draw:isDraw,saved:true}},
     }):null);
   }
 
   function unlockScore(idx:number){
     if(!activeSession)return;
-    // 저장 취소 시 해당 게임 이후 생성된 게임들도 제거 (재계산 필요)
-    const newMatches=activeSession.matches.slice(0,idx+1);
-    const newScoreInputs:Record<number,ScoreInput>={};
-    for(let i=0;i<=idx;i++){
-      newScoreInputs[i]=i===idx
-        ?{...activeSession.scoreInputs[idx],saved:false}
-        :activeSession.scoreInputs[i];
-    }
-    // 히스토리도 해당 게임 이전까지만 유지
-    const newHistory=activeSession.playHistory.slice(0,idx);
-
-    // 연속 카운트 재계산
-    const newConsecutive:Record<string,number>={};
-    const newPc:Record<string,Record<string,number>>={};
-    const newOc:Record<string,Record<string,number>>={};
-    activeSession.players.forEach(p=>{
-      newPc[p]={};newOc[p]={};
-      activeSession.players.forEach(q=>{newPc[p][q]=0;newOc[p][q]=0;});
-      newConsecutive[p]=0;
-    });
-    newHistory.forEach(h=>{
-      updateCounts(h.pair1,h.pair2,newPc,newOc);
-      activeSession.players.forEach(p=>{
-        if(h.players.includes(p))newConsecutive[p]=(newConsecutive[p]||0)+1;
-        else newConsecutive[p]=0;
-      });
-    });
-
     setActiveSession(prev=>prev?({
       ...prev,
-      matches:newMatches,
-      scoreInputs:newScoreInputs,
-      playHistory:newHistory,
-      consecutiveCount:newConsecutive,
-      partnerCount:newPc,
-      opponentCount:newOc,
+      scoreInputs:{...prev.scoreInputs,[idx]:{...prev.scoreInputs[idx],saved:false}},
     }):null);
   }
 
@@ -671,27 +672,28 @@ export default function App(){
     setActiveSession(prev=>prev?({...prev,scoreInputs:{...prev.scoreInputs,[idx]:{...prev.scoreInputs[idx],[field]:val}}}):null);
   }
 
-  // 수동으로 게임 추가 (목표 게임 수 초과 시)
+  // 수동으로 게임 추가 (목표 게임 수 초과 시) — 기존 대진은 유지, 마지막에 중복 없는 1게임 추가
   function addGame(){
     if(!activeSession)return;
-    const nextIdx=activeSession.matches.length;
-    const nextMatch=generateNextMatch(
-      activeSession.players,
-      activeSession.playHistory,
-      activeSession.consecutiveCount,
-      activeSession.lastRested,
-      activeSession.playerStatus,
-      nextIdx,
-      activeSession.numGames+1,
-      activeSession.partnerCount,
-      activeSession.opponentCount,
-    );
-    setActiveSession(prev=>prev?({
-      ...prev,
-      matches:[...prev.matches,nextMatch],
-      scoreInputs:{...prev.scoreInputs,[nextIdx]:emptyScore()},
-      numGames:prev.numGames+1,
-    }):null);
+    const newNumGames=activeSession.numGames+1;
+    const sched=buildSchedule(activeSession.players,activeSession.playerStatus,newNumGames,activeSession.matches);
+    setActiveSession(prev=>{
+      if(!prev)return null;
+      const scoreInputs:Record<number,ScoreInput>={...prev.scoreInputs};
+      sched.matches.forEach((_,idx)=>{
+        if(!(idx in scoreInputs))scoreInputs[idx]=emptyScore();
+      });
+      return{
+        ...prev,
+        matches:sched.matches,
+        scoreInputs,
+        numGames:newNumGames,
+        playHistory:sched.history,
+        consecutiveCount:sched.consecutive,
+        partnerCount:sched.pc,
+        opponentCount:sched.oc,
+      };
+    });
   }
 
   async function finalizeSession(){
@@ -799,9 +801,9 @@ export default function App(){
     playHistory.forEach(h=>{h.players.forEach(p=>{actualCount[p]=(actualCount[p]||0)+1;});});
 
     // 아직 저장 안 된 현재 게임도 표시 (진행 중인 게임)
-    const currentGameIdx=matches.length-1;
-    const currentScore=scoreInputs[currentGameIdx];
-    const currentPlaying=!currentScore?.saved
+    // 아직 저장 안 된 첫 번째(=지금 진행해야 할) 게임을 "진행 중"으로 표시
+    const currentGameIdx=matches.findIndex((_,idx)=>!scoreInputs[idx]?.saved);
+    const currentPlaying=currentGameIdx>=0
       ?[...matches[currentGameIdx].pair1,...matches[currentGameIdx].pair2]
       :[];
 
@@ -1082,9 +1084,9 @@ export default function App(){
                 {todayPlayers.length>=4&&todayPlayers.length<=6&&(
                   <div style={{background:C.tealL,borderRadius:8,padding:"8px 12px",marginBottom:12,fontSize:12,color:C.tealD}}>오늘 참가자: {todayPlayers.join(", ")}</div>
                 )}
-                <button onClick={startSession} disabled={todayPlayers.length<4||todayPlayers.length>6} style={{padding:"10px 22px",borderRadius:8,fontSize:14,cursor:todayPlayers.length>=4?"pointer":"not-allowed",background:todayPlayers.length>=4&&todayPlayers.length<=6?C.teal:"#E5E7EB",color:todayPlayers.length>=4&&todayPlayers.length<=6?"#fff":C.gray,border:"none",fontWeight:500}}>🎾 1게임 대진 생성</button>
+                <button onClick={startSession} disabled={todayPlayers.length<4||todayPlayers.length>6} style={{padding:"10px 22px",borderRadius:8,fontSize:14,cursor:todayPlayers.length>=4?"pointer":"not-allowed",background:todayPlayers.length>=4&&todayPlayers.length<=6?C.teal:"#E5E7EB",color:todayPlayers.length>=4&&todayPlayers.length<=6?"#fff":C.gray,border:"none",fontWeight:500}}>🎾 {numGames}게임 대진표 생성</button>
                 {todayPlayers.length<4&&<p style={{margin:"8px 0 0",fontSize:12,color:C.coral}}>최소 4명 이상 선택해주세요.</p>}
-                <p style={{margin:"8px 0 0",fontSize:11,color:C.gray}}>💡 1게임 스코어 저장 후 다음 게임이 자동 생성됩니다</p>
+                <p style={{margin:"8px 0 0",fontSize:11,color:C.gray}}>💡 설정한 게임 수만큼 KDK 기준 대진이 한번에 생성됩니다. 대진을 수기로 바꾸면 이후 게임은 중복 없는 페어로 자동 재계산돼요.</p>
               </div>
             </div>
           </div>
@@ -1094,30 +1096,32 @@ export default function App(){
           <div>
             {sessions.length>0&&(
               <div style={{borderRadius:12,overflow:"hidden",border:"1px solid #E5E7EB",marginBottom:14}}>
-                <div style={{background:C.gray,padding:"10px 16px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <button onClick={()=>setShowAllPastSessions(v=>!v)} style={{width:"100%",background:C.gray,padding:"10px 16px",display:"flex",justifyContent:"space-between",alignItems:"center",border:"none",cursor:"pointer"}}>
                   <span style={{fontSize:14,fontWeight:500,color:"#fff"}}>📂 지난 대진표</span>
-                  <span style={{fontSize:12,color:"rgba(255,255,255,0.7)"}}>총 {sessions.length}회</span>
-                </div>
-                <div style={{background:"#fff",padding:"10px 16px",display:"grid",gap:6}}>
-                  {[...sessions].reverse().map((s,i)=>{
-                    const realIdx=sessions.length-1-i;
-                    return(
-                      <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 12px",borderRadius:8,border:"1px solid #E5E7EB"}}>
-                        <button onClick={()=>setPastSessionIdx(realIdx)} style={{flex:1,display:"flex",flexDirection:"column",gap:2,background:"none",border:"none",cursor:"pointer",textAlign:"left",padding:0}}>
-                          <div style={{display:"flex",alignItems:"center",gap:8}}>
-                            <span style={{fontSize:13,fontWeight:500,color:"#111"}}>{s.date}</span>
-                            <span style={{fontSize:11,color:C.gray}}>{s.players.join(", ")}</span>
+                  <span style={{fontSize:12,color:"rgba(255,255,255,0.85)",display:"flex",alignItems:"center",gap:6}}>총 {sessions.length}회 {showAllPastSessions?"▲ 접기":"▼ 더보기"}</span>
+                </button>
+                {showAllPastSessions&&(
+                  <div style={{background:"#fff",padding:"10px 16px",display:"grid",gap:6}}>
+                    {[...sessions].reverse().map((s,i)=>{
+                      const realIdx=sessions.length-1-i;
+                      return(
+                        <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 12px",borderRadius:8,border:"1px solid #E5E7EB"}}>
+                          <button onClick={()=>setPastSessionIdx(realIdx)} style={{flex:1,display:"flex",flexDirection:"column",gap:2,background:"none",border:"none",cursor:"pointer",textAlign:"left",padding:0}}>
+                            <div style={{display:"flex",alignItems:"center",gap:8}}>
+                              <span style={{fontSize:13,fontWeight:500,color:"#111"}}>{s.date}</span>
+                              <span style={{fontSize:11,color:C.gray}}>{s.players.join(", ")}</span>
+                            </div>
+                            {s.note&&<span style={{fontSize:11,color:C.tealD,background:C.tealL,padding:"1px 6px",borderRadius:4}}>📝 {s.note.slice(0,30)}{s.note.length>30?"...":""}</span>}
+                          </button>
+                          <div style={{display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
+                            <span style={{fontSize:12,color:C.teal,fontWeight:500}}>{s.matches.length}게임</span>
+                            <button onClick={()=>deleteSessionDB(realIdx)} style={{fontSize:11,padding:"3px 8px",borderRadius:6,border:"1px solid #FECACA",background:"#FEF2F2",color:C.coral,cursor:"pointer"}}>삭제</button>
                           </div>
-                          {s.note&&<span style={{fontSize:11,color:C.tealD,background:C.tealL,padding:"1px 6px",borderRadius:4}}>📝 {s.note.slice(0,30)}{s.note.length>30?"...":""}</span>}
-                        </button>
-                        <div style={{display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
-                          <span style={{fontSize:12,color:C.teal,fontWeight:500}}>{s.matches.length}게임</span>
-                          <button onClick={()=>deleteSessionDB(realIdx)} style={{fontSize:11,padding:"3px 8px",borderRadius:6,border:"1px solid #FECACA",background:"#FEF2F2",color:C.coral,cursor:"pointer"}}>삭제</button>
                         </div>
-                      </div>
-                    );
-                  })}
-                </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             )}
             {!activeSession?(
@@ -1135,7 +1139,7 @@ export default function App(){
                   </div>
                   <div style={{textAlign:"right"}}>
                     <span style={{fontSize:13,fontWeight:500,color:C.tealD}}>{savedCount}/{activeSession.numGames} 완료</span>
-                    <p style={{margin:"2px 0 0",fontSize:11,color:C.teal}}>스코어 저장 시 다음 게임 자동 생성</p>
+                    <p style={{margin:"2px 0 0",fontSize:11,color:C.teal}}>대진 수정 시 이후 게임 자동 재계산</p>
                   </div>
                 </div>
 
@@ -1146,8 +1150,12 @@ export default function App(){
                   {activeSession.matches.map((m,i)=>{
                     const s=activeSession.scoreInputs[i]||emptyScore();
                     const pl=activeSession.players;
-                    const pairOpts:string[][]=[];
-                    for(let a=0;a<pl.length;a++)for(let b=a+1;b<pl.length;b++)pairOpts.push([pl[a],pl[b]]);
+                    const allPairOpts:string[][]=[];
+                    for(let a=0;a<pl.length;a++)for(let b=a+1;b<pl.length;b++)allPairOpts.push([pl[a],pl[b]]);
+                    // 상대 팀과 인원이 겹치지 않는 조합만 선택 가능하게 필터링 (오류 대진 원천 차단)
+                    const pair1Opts=allPairOpts.filter(p=>!p.some(x=>m.pair2.includes(x)));
+                    const pair2Opts=allPairOpts.filter(p=>!p.some(x=>m.pair1.includes(x)));
+                    const matchInvalid=!isValidMatch(m);
                     const drawNow=s.a!==""&&s.b!==""&&parseInt(s.a)===parseInt(s.b);
 
                     // 이 게임에서 쉬는 사람
@@ -1159,11 +1167,11 @@ export default function App(){
                       return !playingNow.includes(p);
                     });
 
-                    // 마지막 게임이고 아직 저장 안 됨 = 현재 진행 게임
-                    const isCurrentGame=i===activeSession.matches.length-1&&!s.saved;
+                    // 저장 안 된 게임 중 가장 첫 번째 = 지금 진행할 게임
+                    const isCurrentGame=!s.saved&&activeSession.matches.findIndex((_,idx)=>!(activeSession.scoreInputs[idx]?.saved))===i;
 
                     return(
-                      <div key={i} style={{background:"#fff",border:`2px solid ${s.saved?(s.draw?C.amber:C.teal):isCurrentGame?C.purple:"#E5E7EB"}`,borderRadius:12,padding:"14px 16px"}}>
+                      <div key={i} style={{background:"#fff",border:`2px solid ${matchInvalid?C.coral:s.saved?(s.draw?C.amber:C.teal):isCurrentGame?C.purple:"#E5E7EB"}`,borderRadius:12,padding:"14px 16px"}}>
                         <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}>
                           <div style={{display:"flex",alignItems:"center",gap:6}}>
                             <span style={{fontSize:12,fontWeight:500,color:C.gray,background:C.grayL,padding:"2px 8px",borderRadius:10}}>게임 {i+1}</span>
@@ -1179,13 +1187,18 @@ export default function App(){
                             </div>
                           )}
                         </div>
+                        {matchInvalid&&(
+                          <div style={{background:C.coralL,border:`1px solid ${C.coral}`,borderRadius:8,padding:"6px 10px",marginBottom:8,fontSize:12,color:C.coralD,fontWeight:500}}>
+                            ⚠️ 오류: 같은 사람이 양쪽 팀에 포함되어 있습니다. 대진을 다시 선택해주세요.
+                          </div>
+                        )}
                         <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
-                          <select value={m.pair1.join("||")} onChange={e=>{const p=e.target.value.split("||");setActiveSession(prev=>{if(!prev)return null;const nm=[...prev.matches];nm[i]={...nm[i],pair1:p};return{...prev,matches:nm};});}} disabled={s.saved} style={{flex:1,fontSize:13,padding:"6px 8px",borderRadius:8,border:"1px solid #D1D5DB",outline:"none",background:s.saved?"#F9FAFB":"#fff"}}>
-                            {pairOpts.map(p=><option key={p.join("||")} value={p.join("||")}>{p.join(" & ")}</option>)}
+                          <select value={m.pair1.join("||")} onChange={e=>updateMatchPair(i,"pair1",e.target.value.split("||"))} disabled={s.saved} style={{flex:1,fontSize:13,padding:"6px 8px",borderRadius:8,border:`1px solid ${matchInvalid?C.coral:"#D1D5DB"}`,outline:"none",background:s.saved?"#F9FAFB":"#fff"}}>
+                            {pair1Opts.map(p=><option key={p.join("||")} value={p.join("||")}>{p.join(" & ")}</option>)}
                           </select>
                           <span style={{fontSize:12,color:C.gray}}>vs</span>
-                          <select value={m.pair2.join("||")} onChange={e=>{const p=e.target.value.split("||");setActiveSession(prev=>{if(!prev)return null;const nm=[...prev.matches];nm[i]={...nm[i],pair2:p};return{...prev,matches:nm};});}} disabled={s.saved} style={{flex:1,fontSize:13,padding:"6px 8px",borderRadius:8,border:"1px solid #D1D5DB",outline:"none",background:s.saved?"#F9FAFB":"#fff"}}>
-                            {pairOpts.map(p=><option key={p.join("||")} value={p.join("||")}>{p.join(" & ")}</option>)}
+                          <select value={m.pair2.join("||")} onChange={e=>updateMatchPair(i,"pair2",e.target.value.split("||"))} disabled={s.saved} style={{flex:1,fontSize:13,padding:"6px 8px",borderRadius:8,border:`1px solid ${matchInvalid?C.coral:"#D1D5DB"}`,outline:"none",background:s.saved?"#F9FAFB":"#fff"}}>
+                            {pair2Opts.map(p=><option key={p.join("||")} value={p.join("||")}>{p.join(" & ")}</option>)}
                           </select>
                         </div>
                         {!s.saved?(
@@ -1194,7 +1207,7 @@ export default function App(){
                               <input type="number" min="0" max="99" placeholder="A" value={s.a} onChange={e=>updateScore(i,"a",e.target.value)} style={{width:64,fontSize:24,padding:"8px",borderRadius:8,border:`1.5px solid ${drawNow?C.amber:C.teal}`,outline:"none",textAlign:"center",fontWeight:700}}/>
                               <span style={{fontSize:drawNow?20:14,color:drawNow?C.amber:C.gray}}>{drawNow?"🤝":":"}</span>
                               <input type="number" min="0" max="99" placeholder="B" value={s.b} onChange={e=>updateScore(i,"b",e.target.value)} style={{width:64,fontSize:24,padding:"8px",borderRadius:8,border:`1.5px solid ${drawNow?C.amber:C.coral}`,outline:"none",textAlign:"center",fontWeight:700}}/>
-                              <button onClick={()=>saveScore(i)} style={{flex:1,padding:"10px",borderRadius:8,fontSize:14,cursor:"pointer",background:drawNow?C.amber:C.purple,color:"#fff",border:"none",fontWeight:600}}>저장 + 다음 생성</button>
+                              <button onClick={()=>saveScore(i)} disabled={matchInvalid} style={{flex:1,padding:"10px",borderRadius:8,fontSize:14,cursor:matchInvalid?"not-allowed":"pointer",background:matchInvalid?"#E5E7EB":drawNow?C.amber:C.purple,color:matchInvalid?C.gray:"#fff",border:"none",fontWeight:600}}>✓ 스코어 저장</button>
                             </div>
                             {drawNow&&<p style={{margin:"6px 0 0",fontSize:11,color:C.amberD,textAlign:"center"}}>🤝 동점 — 저장 시 무승부로 처리됩니다</p>}
                           </>

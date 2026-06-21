@@ -1186,8 +1186,9 @@ export default function App(){
                     const allPairOpts:string[][]=[];
                     for(let a=0;a<pl.length;a++)for(let b=a+1;b<pl.length;b++)allPairOpts.push([pl[a],pl[b]]);
                     // 상대 팀과 인원이 겹치지 않는 조합만 선택 가능하게 필터링 (오류 대진 원천 차단)
-                    const pair1Opts=allPairOpts.filter(p=>!p.some(x=>m.pair2.includes(x)));
-                    const pair2Opts=allPairOpts.filter(p=>!p.some(x=>m.pair1.includes(x)));
+                   // 수동 수정 시 모든 페어 조합 표시
+const pair1Opts = allPairOpts;
+const pair2Opts = allPairOpts;
                     const matchInvalid=!isValidMatch(m);
                     const drawNow=s.a!==""&&s.b!==""&&parseInt(s.a)===parseInt(s.b);
 

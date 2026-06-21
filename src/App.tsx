@@ -365,6 +365,7 @@ function buildSchedule(
 }
 
 
+function calcParticipation(players:string[],numGames:number,playerStatus:Record<string,string>={}){
   const result:Record<string,number[]>={};
   players.forEach(p=>{result[p]=[];for(let i=0;i<numGames;i++){const st=playerStatus[p]||"";if(st==="late"&&i===0)continue;if(st==="early"&&i>=numGames-2)continue;result[p].push(i);}});
   return result;

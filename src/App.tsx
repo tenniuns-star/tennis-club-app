@@ -134,29 +134,28 @@ function selectFivePlayers(
   lastRested: Record<string,number>,
   gameIndex: number
 ): string[] {
-  // 직전에 쉰 사람 우선 투입
+  // 직전에 쉰 사람 우선 투입 (중복 제거)
   const lastGame = playHistory[playHistory.length - 1];
   const restedLast = lastGame ? lastGame.rested : [];
 
-  // 연속 게임 수 기준으로 정렬 (많이 뛴 사람이 쉬어야 함)
-  const sorted = [...players].sort((a, b) => {
-    const ac = consecutiveCount[a] || 0;
-    const bc = consecutiveCount[b] || 0;
-    // 직전에 쉰 사람은 우선순위 높게 (연속=0이므로 자연스럽게 반영됨)
-    return bc - ac; // 연속 많은 사람이 뒤로 (쉬어야 하므로)
-  });
+  // mustPlay: 직전에 쉰 사람 중 현재 available에 있는 사람 (중복 제거)
+  const mustPlay = [...new Set(restedLast.filter(p => players.includes(p)))];
 
-  // 연속이 가장 많은 1명을 쉬게 함
-  // 단 직전에 쉰 사람은 무조건 포함
-  let mustPlay = restedLast.filter(p => players.includes(p));
+  // candidates: mustPlay에 없는 나머지
   let candidates = players.filter(p => !mustPlay.includes(p));
 
-  // 연속 많은 순으로 정렬해서 1명 제외
-  candidates.sort((a, b) => (consecutiveCount[b]||0) - (consecutiveCount[a]||0));
+  // 연속이 가장 많은 사람이 쉬어야 하므로 → 연속 적은(적게 뛴) 사람 우선 선발
+  candidates.sort((a, b) => (consecutiveCount[a]||0) - (consecutiveCount[b]||0));
 
-  // mustPlay + candidates에서 4명 선발
+  // mustPlay 우선, 나머지는 연속 적은 순으로 채워 4명 선발
   const pool = [...mustPlay, ...candidates];
-  return pool.slice(0, 4);
+  // 중복 없이 4명 추출
+  const result: string[] = [];
+  for (const p of pool) {
+    if (!result.includes(p)) result.push(p);
+    if (result.length === 4) break;
+  }
+  return result;
 }
 
 function selectSixPlayers(
@@ -169,29 +168,41 @@ function selectSixPlayers(
   const lastGame = playHistory[playHistory.length - 1];
   const restedLast = lastGame ? lastGame.rested : [];
 
-  // 직전에 쉰 사람(2명) 우선 투입
-  let mustPlay = restedLast.filter(p => players.includes(p));
+  // 직전에 쉰 사람(최대 2명) 우선 투입 — 중복 제거
+  const mustPlay = [...new Set(restedLast.filter(p => players.includes(p)))];
 
-  // 연속 2게임 이상인 사람은 강제 휴식
+  // mustPlay가 이미 4명 이상이면 4명만 선발 (중복 없이)
+  if (mustPlay.length >= 4) {
+    const res: string[] = [];
+    for (const p of mustPlay) {
+      if (!res.includes(p)) res.push(p);
+      if (res.length === 4) break;
+    }
+    return res;
+  }
+
+  // 연속 2게임 이상인 사람은 강제 휴식 (mustPlay 제외)
   const forcedRest = players.filter(p =>
     !mustPlay.includes(p) && (consecutiveCount[p] || 0) >= 2
   );
 
-  // 나머지 후보들
+  // 나머지 후보들 (mustPlay, forcedRest 제외)
   let candidates = players.filter(p =>
     !mustPlay.includes(p) && !forcedRest.includes(p)
   );
-
-  // mustPlay가 4명 이상이면 그냥 4명만 선발
-  if (mustPlay.length >= 4) {
-    return mustPlay.slice(0, 4);
-  }
 
   // 나머지 자리 채우기: 연속 횟수 적은 사람 우선
   const needed = 4 - mustPlay.length;
   candidates.sort((a, b) => (consecutiveCount[a]||0) - (consecutiveCount[b]||0));
 
-  return [...mustPlay, ...candidates.slice(0, needed)];
+  // 중복 없이 4명 추출
+  const pool = [...mustPlay, ...candidates];
+  const result: string[] = [];
+  for (const p of pool) {
+    if (!result.includes(p)) result.push(p);
+    if (result.length === 4) break;
+  }
+  return result;
 }
 
 function bestPair(
@@ -200,13 +211,15 @@ function bestPair(
   opponentCount: Record<string,Record<string,number>>,
   usedMatchKeys?: Set<string>,
 ): Match {
-  if (players.length < 4) {
-    // 예외 처리
-    return { pair1: players.slice(0,2), pair2: players.slice(2,4) };
+  // 중복 제거 후 4명 확보
+  const unique = [...new Set(players)];
+  if (unique.length < 4) {
+    // 예외 처리: 중복 제거 후 4명 미만이면 원본에서 최선으로 처리
+    return { pair1: unique.slice(0,2), pair2: unique.slice(2,4) };
   }
 
-  const [a, b, c, d] = players;
-  // 가능한 페어 조합 3가지
+  const [a, b, c, d] = unique;
+  // 가능한 페어 조합 3가지 (4명 모두 다른 경우만)
   const combos: Match[] = [
     { pair1: [a,b], pair2: [c,d] },
     { pair1: [a,c], pair2: [b,d] },
@@ -791,15 +804,19 @@ export default function App(){
   const savedCount=activeSession?Object.values(activeSession.scoreInputs).filter(s=>s.saved).length:0;
   const sortedGuests=[...guests].sort((a,b)=>guestTotalVisits(b.name)-guestTotalVisits(a.name));
 
-  // ─── 인당 실제 게임 수 표시 (playHistory 기반) ───────────────
+  // ─── 인당 실제 게임 수 표시 (스코어 저장 기준) ───────────────
   function PlayerGameCount(){
     if(!activeSession)return null;
-    const{players,playHistory,playerStatus,matches,scoreInputs}=activeSession;
+    const{players,playerStatus,matches,scoreInputs}=activeSession;
 
-    // 저장된 게임 기준 실제 참여 횟수
+    // 스코어가 저장된 게임만 카운트 (전체 0게임에서 시작, 저장 시 +1)
     const actualCount:Record<string,number>={};
     players.forEach(p=>{actualCount[p]=0;});
-    playHistory.forEach(h=>{h.players.forEach(p=>{actualCount[p]=(actualCount[p]||0)+1;});});
+    matches.forEach((m,i)=>{
+      if(scoreInputs[i]?.saved){
+        [...m.pair1,...m.pair2].forEach(p=>{actualCount[p]=(actualCount[p]||0)+1;});
+      }
+    });
 
     // 아직 저장 안 된 현재 게임도 표시 (진행 중인 게임)
     // 아직 저장 안 된 첫 번째(=지금 진행해야 할) 게임을 "진행 중"으로 표시

@@ -343,14 +343,25 @@ function buildSchedule(
   const usedMatchKeys = new Set<string>();
   const matches: Match[] = [];
 
+  // ★ 페어 내 선수 순서를 players 배열 순서(등록 순서)로 정렬
+  // allPairOpts는 항상 등록 순서(낮은 인덱스 먼저)로 생성되므로, 저장도 동일하게 맞춰야 드롭다운이 올바르게 표시됨
+  function sortPair(pair: string[]): string[] {
+    return [...pair].sort((a, b) => players.indexOf(a) - players.indexOf(b));
+  }
+
   function applyMatch(m: Match, idx: number) {
-    matches.push(m);
+    // 페어 순서 정규화: 드롭다운 옵션(allPairOpts)과 동일한 순서로 저장
+    const normalized: Match = {
+      pair1: sortPair(m.pair1),
+      pair2: sortPair(m.pair2),
+    };
+    matches.push(normalized);
     // 유효한 대진만 카운트에 반영 (유효하지 않으면 표시만 유지)
-    if (isValidMatch(m)) {
-      updateCounts(m.pair1, m.pair2, pc, oc);
-      usedMatchKeys.add(matchKey(m));
+    if (isValidMatch(normalized)) {
+      updateCounts(normalized.pair1, normalized.pair2, pc, oc);
+      usedMatchKeys.add(matchKey(normalized));
     }
-    const played = [...new Set([...m.pair1, ...m.pair2])]; // 중복 제거
+    const played = [...new Set([...normalized.pair1, ...normalized.pair2])]; // 중복 제거
     players.forEach(p => {
       if (played.includes(p)) consecutive[p] = (consecutive[p]||0) + 1;
       else consecutive[p] = 0;
@@ -361,7 +372,7 @@ function buildSchedule(
       if (st === "early" && idx >= numGames - 2) return true;
       return !played.includes(p);
     });
-    history.push({ players: played, pair1: [...m.pair1], pair2: [...m.pair2], rested });
+    history.push({ players: played, pair1: [...normalized.pair1], pair2: [...normalized.pair2], rested });
   }
 
   // 고정된(이미 결정된) 앞부분 대진 그대로 적용

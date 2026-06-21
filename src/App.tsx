@@ -602,13 +602,13 @@ export default function App(){
   }
 
   function startSession(){
-    if(todayPlayers.length<4)return alert("최소 4명이 필요합니다.");
-    if(todayPlayers.length>6)return alert("최대 6명까지 가능합니다.");
+    // ★ 중복 제거를 가장 먼저 — 정회원+게스트에 같은 이름이 있어도 1명으로 처리
+    const players=[...new Set(todayPlayers)];
+    if(players.length<4)return alert("최소 4명이 필요합니다.");
+    if(players.length>6)return alert("최대 6명까지 가능합니다.");
     const allStatus:Record<string,string>={};
     presentMembers.forEach(m=>{allStatus[m]=memberStatus[m]||"";});
     todayGuests.forEach(g=>{allStatus[g]=guestStatus[g]||"";});
-
-    const players=[...todayPlayers];
 
     // 설정한 게임 수만큼 KDK 기준으로 전체 대진을 한번에 생성
     const sched=buildSchedule(players,allStatus,numGames,[]);

@@ -41,9 +41,7 @@ const C = {
 };
 
 function pairKey(p: string[]){return[...p].sort().join(" & ");}
-// 매치(페어 vs 페어) 고유키 - 순서 무관 (동일 대진 중복 감지용)
 function matchKey(m: {pair1:string[];pair2:string[]}){return[pairKey(m.pair1),pairKey(m.pair2)].sort().join(" || ");}
-// 대진 유효성 검사: 양 팀 합쳐 4명이 모두 달라야 함 (한 사람이 양쪽 팀에 동시에 있으면 안 됨)
 function isValidMatch(m:{pair1:string[];pair2:string[]}):boolean{
   if(m.pair1.length!==2||m.pair2.length!==2)return false;
   const all=[...m.pair1,...m.pair2];
@@ -58,12 +56,11 @@ interface CompletedMatch{pair1:string[];pair2:string[];score1:string;score2:stri
 interface Session{id?:string;date:string;players:string[];matches:CompletedMatch[];playerStatus:Record<string,string>;note?:string;}
 interface Guest{id:number;name:string;visits:string[];phone:string;level:string;note:string;}
 
-// ─── 로테이션 누적 기록 ───────────────────────────────────────
 interface PlayRecord {
-  players: string[];      // 실제 플레이한 4명
+  players: string[];
   pair1: string[];
   pair2: string[];
-  rested: string[];       // 쉰 사람
+  rested: string[];
 }
 
 interface ActiveSession{
@@ -74,11 +71,9 @@ interface ActiveSession{
   playerStatus:Record<string,string>;
   numGames:number;
   note:string;
-  // 로테이션 누적 기록
-  playHistory: PlayRecord[];          // 저장된 게임들의 실제 기록
-  consecutiveCount: Record<string,number>; // 연속 게임 횟수
-  lastRested: Record<string,number>;  // 마지막으로 쉰 게임 인덱스
-  // 파트너/상대 누적 (KDK용)
+  playHistory: PlayRecord[];
+  consecutiveCount: Record<string,number>;
+  lastRested: Record<string,number>;
   partnerCount: Record<string,Record<string,number>>;
   opponentCount: Record<string,Record<string,number>>;
 }
@@ -86,20 +81,18 @@ interface ActiveSession{
 interface GuestForm{name:string;phone:string;level:string;note:string;}
 interface AppConfig{clubName:string;clubSubtitle:string;members:string[];nextSessionNote:string;}
 
-// ─── 다음 게임 자동 생성 핵심 로직 ───────────────────────────
 function generateNextMatch(
   allPlayers: string[],
   playHistory: PlayRecord[],
   consecutiveCount: Record<string,number>,
   lastRested: Record<string,number>,
   playerStatus: Record<string,string>,
-  gameIndex: number, // 다음 게임이 몇 번째인지 (0-based)
+  gameIndex: number,
   numGames: number,
   partnerCount: Record<string,Record<string,number>>,
   opponentCount: Record<string,Record<string,number>>,
   usedMatchKeys?: Set<string>,
 ): Match {
-  // ★ 중복 제거: available 배열에 같은 이름이 두 번 들어오는 경우 원천 차단
   const available = [...new Set(allPlayers.filter(p => {
     const st = playerStatus[p] || "";
     if (st === "late" && gameIndex === 0) return false;
@@ -110,19 +103,14 @@ function generateNextMatch(
   let selected: string[] = [];
 
   if (available.length <= 4) {
-    // 4명 이하: 전원 참가
     selected = [...available];
   } else if (available.length === 5) {
-    // 5명: 1명 대기
     selected = selectFivePlayers(available, playHistory, consecutiveCount, lastRested, gameIndex);
   } else {
-    // 6명 이상: 4명 선발, 나머지 대기
     selected = selectSixPlayers(available, playHistory, consecutiveCount, lastRested, gameIndex);
   }
 
-  // 최종 중복 제거 (방어 코드)
   const uniqueSelected = [...new Set(selected)].slice(0, 4);
-  // 4명 확정 후 KDK 페어 최적화 (이미 나온 완전 동일 대진은 회피)
   return bestPair(uniqueSelected, partnerCount, opponentCount, usedMatchKeys);
 }
 
@@ -133,22 +121,12 @@ function selectFivePlayers(
   lastRested: Record<string,number>,
   gameIndex: number
 ): string[] {
-  // 직전에 쉰 사람 우선 투입 (중복 제거)
   const lastGame = playHistory[playHistory.length - 1];
   const restedLast = lastGame ? lastGame.rested : [];
-
-  // mustPlay: 직전에 쉰 사람 중 현재 available에 있는 사람 (중복 제거)
   const mustPlay = [...new Set(restedLast.filter(p => players.includes(p)))];
-
-  // candidates: mustPlay에 없는 나머지
   let candidates = players.filter(p => !mustPlay.includes(p));
-
-  // 연속이 가장 많은 사람이 쉬어야 하므로 → 연속 적은(적게 뛴) 사람 우선 선발
   candidates.sort((a, b) => (consecutiveCount[a]||0) - (consecutiveCount[b]||0));
-
-  // mustPlay 우선, 나머지는 연속 적은 순으로 채워 4명 선발
   const pool = [...mustPlay, ...candidates];
-  // 중복 없이 4명 추출
   const result: string[] = [];
   for (const p of pool) {
     if (!result.includes(p)) result.push(p);
@@ -166,11 +144,7 @@ function selectSixPlayers(
 ): string[] {
   const lastGame = playHistory[playHistory.length - 1];
   const restedLast = lastGame ? lastGame.rested : [];
-
-  // 직전에 쉰 사람(최대 2명) 우선 투입 — 중복 제거
   const mustPlay = [...new Set(restedLast.filter(p => players.includes(p)))];
-
-  // mustPlay가 이미 4명 이상이면 4명만 선발 (중복 없이)
   if (mustPlay.length >= 4) {
     const res: string[] = [];
     for (const p of mustPlay) {
@@ -179,22 +153,13 @@ function selectSixPlayers(
     }
     return res;
   }
-
-  // 연속 2게임 이상인 사람은 강제 휴식 (mustPlay 제외)
   const forcedRest = players.filter(p =>
     !mustPlay.includes(p) && (consecutiveCount[p] || 0) >= 2
   );
-
-  // 나머지 후보들 (mustPlay, forcedRest 제외)
   let candidates = players.filter(p =>
     !mustPlay.includes(p) && !forcedRest.includes(p)
   );
-
-  // 나머지 자리 채우기: 연속 횟수 적은 사람 우선
-  const needed = 4 - mustPlay.length;
   candidates.sort((a, b) => (consecutiveCount[a]||0) - (consecutiveCount[b]||0));
-
-  // 중복 없이 4명 추출
   const pool = [...mustPlay, ...candidates];
   const result: string[] = [];
   for (const p of pool) {
@@ -210,15 +175,12 @@ function bestPair(
   opponentCount: Record<string,Record<string,number>>,
   usedMatchKeys?: Set<string>,
 ): Match {
-  // 중복 제거 후 4명 확보
   const unique = [...new Set(players)];
   if (unique.length < 4) {
-    // 예외 처리: 중복 제거 후 4명 미만이면 원본에서 최선으로 처리
     return { pair1: unique.slice(0,2), pair2: unique.slice(2,4) };
   }
 
   const [a, b, c, d] = unique;
-  // 가능한 페어 조합 3가지 (4명 모두 다른 경우만)
   const combos: Match[] = [
     { pair1: [a,b], pair2: [c,d] },
     { pair1: [a,c], pair2: [b,d] },
@@ -240,7 +202,6 @@ function bestPair(
       (opponentCount[p1a]?.[p2b] || 0) +
       (opponentCount[p1b]?.[p2a] || 0) +
       (opponentCount[p1b]?.[p2b] || 0);
-    // 완전히 동일한 대진(페어 vs 페어)이 이미 나온 적 있으면 강하게 회피
     if (usedMatchKeys?.has(matchKey(m))) score += 1000;
     if (score < bestScore) {
       bestScore = score;
@@ -251,7 +212,6 @@ function bestPair(
   return bestCombo;
 }
 
-// KDK 초기 대진표 생성 (첫 게임만 or 전체 미리보기용)
 function generateKDK(players:string[],numGames:number,playerStatus:Record<string,string>={}):Match[]{
   function availFor(gi:number){return players.filter(p=>{const st=playerStatus[p]||"";if(st==="late"&&gi===0)return false;if(st==="early"&&gi>=numGames-2)return false;return true;});}
   function combosFor(pl:string[]):Match[]{
@@ -285,7 +245,6 @@ function generateKDK(players:string[],numGames:number,playerStatus:Record<string
   return selected;
 }
 
-// 누적 카운트 초기화
 function initCounts(players: string[]) {
   const pc: Record<string,Record<string,number>> = {};
   const oc: Record<string,Record<string,number>> = {};
@@ -296,7 +255,6 @@ function initCounts(players: string[]) {
   return { pc, oc };
 }
 
-// 저장된 게임으로부터 누적 카운트 업데이트
 function updateCounts(
   pair1: string[],
   pair2: string[],
@@ -318,9 +276,6 @@ function updateCounts(
   }));
 }
 
-// ─── 전체/부분 대진 스케줄 생성 ─────────────────────────────────
-// fixedMatches: 이미 확정된(또는 사용자가 수기로 지정한) 앞부분 대진들.
-// fixedMatches.length 부터 numGames-1 까지는 중복 페어/중복 대진을 피하며 자동 생성.
 function buildSchedule(
   rawPlayers: string[],
   playerStatus: Record<string,string>,
@@ -333,9 +288,7 @@ function buildSchedule(
   pc: Record<string,Record<string,number>>;
   oc: Record<string,Record<string,number>>;
 } {
-  // ★ 가장 먼저 players 중복 제거 — 이게 모든 버그의 근원 차단
   const players = [...new Set(rawPlayers)];
-
   const { pc, oc } = initCounts(players);
   const consecutive: Record<string,number> = {};
   players.forEach(p => consecutive[p] = 0);
@@ -343,25 +296,21 @@ function buildSchedule(
   const usedMatchKeys = new Set<string>();
   const matches: Match[] = [];
 
-  // ★ 페어 내 선수 순서를 players 배열 순서(등록 순서)로 정렬
-  // allPairOpts는 항상 등록 순서(낮은 인덱스 먼저)로 생성되므로, 저장도 동일하게 맞춰야 드롭다운이 올바르게 표시됨
   function sortPair(pair: string[]): string[] {
     return [...pair].sort((a, b) => players.indexOf(a) - players.indexOf(b));
   }
 
   function applyMatch(m: Match, idx: number) {
-    // 페어 순서 정규화: 드롭다운 옵션(allPairOpts)과 동일한 순서로 저장
     const normalized: Match = {
       pair1: sortPair(m.pair1),
       pair2: sortPair(m.pair2),
     };
     matches.push(normalized);
-    // 유효한 대진만 카운트에 반영 (유효하지 않으면 표시만 유지)
     if (isValidMatch(normalized)) {
       updateCounts(normalized.pair1, normalized.pair2, pc, oc);
       usedMatchKeys.add(matchKey(normalized));
     }
-    const played = [...new Set([...normalized.pair1, ...normalized.pair2])]; // 중복 제거
+    const played = [...new Set([...normalized.pair1, ...normalized.pair2])];
     players.forEach(p => {
       if (played.includes(p)) consecutive[p] = (consecutive[p]||0) + 1;
       else consecutive[p] = 0;
@@ -375,12 +324,10 @@ function buildSchedule(
     history.push({ players: played, pair1: [...normalized.pair1], pair2: [...normalized.pair2], rested });
   }
 
-  // 고정된(이미 결정된) 앞부분 대진 그대로 적용
   fixedMatches.forEach((m, idx) => {
     applyMatch(m, idx);
   });
 
-  // 나머지 게임 자동 생성 (중복 회피)
   for (let gi = fixedMatches.length; gi < numGames; gi++) {
     const nextMatch = generateNextMatch(
       players, history, consecutive, {}, playerStatus,
@@ -392,7 +339,6 @@ function buildSchedule(
   return { matches, history, consecutive, pc, oc };
 }
 
-
 function calcParticipation(players:string[],numGames:number,playerStatus:Record<string,string>={}){
   const result:Record<string,number[]>={};
   players.forEach(p=>{result[p]=[];for(let i=0;i<numGames;i++){const st=playerStatus[p]||"";if(st==="late"&&i===0)continue;if(st==="early"&&i>=numGames-2)continue;result[p].push(i);}});
@@ -400,47 +346,220 @@ function calcParticipation(players:string[],numGames:number,playerStatus:Record<
 }
 function emptyScore():ScoreInput{return{a:"",b:"",draw:false,saved:false};}
 
-function PastSessionDetail({session,onBack,onDelete,onSaveNote}:{session:Session;onBack:()=>void;onDelete:()=>void;onSaveNote:(note:string)=>void;}){
-  const[localNote,setLocalNote]=useState(session.note||"");
-  return(
-    <div style={{fontFamily:"system-ui,sans-serif",maxWidth:720,margin:"0 auto",background:"#F9FAFB",minHeight:"100vh"}}>
-      <div style={{background:`linear-gradient(135deg,${C.teal},${C.tealD})`,padding:"20px"}}>
-        <button onClick={onBack} style={{background:"rgba(255,255,255,0.2)",border:"none",color:"#fff",borderRadius:8,padding:"6px 12px",cursor:"pointer",fontSize:13,marginBottom:12}}>← 뒤로</button>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+// ─── 지난 세션 상세 (수정 기능 포함) ────────────────────────
+function PastSessionDetail({
+  session,
+  onBack,
+  onDelete,
+  onSaveNote,
+  onSaveMatch,
+}: {
+  session: Session;
+  onBack: () => void;
+  onDelete: () => void;
+  onSaveNote: (note: string) => void;
+  onSaveMatch: (matches: CompletedMatch[]) => void;
+}) {
+  const [localNote, setLocalNote] = useState(session.note || "");
+  const [editingIdx, setEditingIdx] = useState<number | null>(null);
+  const [editScore1, setEditScore1] = useState("");
+  const [editScore2, setEditScore2] = useState("");
+  const [editPair1, setEditPair1] = useState<string[]>([]);
+  const [editPair2, setEditPair2] = useState<string[]>([]);
+  const [localMatches, setLocalMatches] = useState<CompletedMatch[]>(session.matches);
+
+  // 참가자 기반 페어 조합 생성
+  const players = session.players;
+  const allPairOpts: string[][] = [];
+  for (let a = 0; a < players.length; a++)
+    for (let b = a + 1; b < players.length; b++)
+      allPairOpts.push([players[a], players[b]]);
+
+  function openEdit(i: number) {
+    const m = localMatches[i];
+    setEditingIdx(i);
+    setEditScore1(m.score1);
+    setEditScore2(m.score2);
+    setEditPair1([...m.pair1]);
+    setEditPair2([...m.pair2]);
+  }
+
+  function cancelEdit() {
+    setEditingIdx(null);
+  }
+
+  function applyEdit(i: number) {
+    if (editScore1 === "" || editScore2 === "") {
+      alert("스코어를 입력해주세요.");
+      return;
+    }
+    const all4 = [...editPair1, ...editPair2];
+    if (new Set(all4).size !== 4) {
+      alert("⚠️ 같은 사람이 두 팀에 동시에 포함될 수 없습니다.");
+      return;
+    }
+    const s1 = parseInt(editScore1);
+    const s2 = parseInt(editScore2);
+    const isDraw = s1 === s2;
+    const winner = isDraw ? null : s1 > s2 ? editPair1 : editPair2;
+    const updated: CompletedMatch = {
+      pair1: editPair1,
+      pair2: editPair2,
+      score1: editScore1,
+      score2: editScore2,
+      winner,
+      draw: isDraw,
+    };
+    const newMatches = localMatches.map((m, idx) => (idx === i ? updated : m));
+    setLocalMatches(newMatches);
+    setEditingIdx(null);
+    onSaveMatch(newMatches);
+  }
+
+  return (
+    <div style={{ fontFamily: "system-ui,sans-serif", maxWidth: 720, margin: "0 auto", background: "#F9FAFB", minHeight: "100vh" }}>
+      {/* 헤더 */}
+      <div style={{ background: `linear-gradient(135deg,${C.teal},${C.tealD})`, padding: "20px" }}>
+        <button onClick={onBack} style={{ background: "rgba(255,255,255,0.2)", border: "none", color: "#fff", borderRadius: 8, padding: "6px 12px", cursor: "pointer", fontSize: 13, marginBottom: 12 }}>← 뒤로</button>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
           <div>
-            <p style={{margin:0,fontSize:18,fontWeight:600,color:"#fff"}}>{session.date} 대진표</p>
-            <p style={{margin:"4px 0 0",fontSize:12,color:"rgba(255,255,255,0.8)"}}>참가: {session.players.join(", ")} · {session.matches.length}게임</p>
+            <p style={{ margin: 0, fontSize: 18, fontWeight: 600, color: "#fff" }}>{session.date} 대진표</p>
+            <p style={{ margin: "4px 0 0", fontSize: 12, color: "rgba(255,255,255,0.8)" }}>참가: {session.players.join(", ")} · {localMatches.length}게임</p>
           </div>
-          <button onClick={onDelete} style={{background:"rgba(232,93,58,0.8)",border:"none",color:"#fff",borderRadius:8,padding:"6px 12px",cursor:"pointer",fontSize:12}}>🗑 삭제</button>
+          <button onClick={onDelete} style={{ background: "rgba(232,93,58,0.8)", border: "none", color: "#fff", borderRadius: 8, padding: "6px 12px", cursor: "pointer", fontSize: 12 }}>🗑 삭제</button>
         </div>
       </div>
-      <div style={{padding:16,display:"grid",gap:10}}>
-        <div style={{background:"#fff",borderRadius:12,border:"1px solid #E5E7EB",padding:"14px 16px"}}>
-          <p style={{margin:"0 0 8px",fontSize:13,fontWeight:600,color:"#111"}}>📝 세션 메모</p>
-          <textarea value={localNote} onChange={e=>setLocalNote(e.target.value)} rows={3} style={{width:"100%",fontSize:13,padding:"8px 12px",borderRadius:8,border:"1px solid #D1D5DB",outline:"none",resize:"vertical",fontFamily:"inherit",boxSizing:"border-box"}}/>
-          <button onClick={()=>{onSaveNote(localNote);alert("메모 저장됐습니다!");}} style={{marginTop:8,padding:"6px 14px",borderRadius:8,fontSize:13,cursor:"pointer",background:C.teal,color:"#fff",border:"none"}}>저장</button>
+
+      <div style={{ padding: 16, display: "grid", gap: 10 }}>
+        {/* 메모 */}
+        <div style={{ background: "#fff", borderRadius: 12, border: "1px solid #E5E7EB", padding: "14px 16px" }}>
+          <p style={{ margin: "0 0 8px", fontSize: 13, fontWeight: 600, color: "#111" }}>📝 세션 메모</p>
+          <textarea value={localNote} onChange={e => setLocalNote(e.target.value)} rows={3} style={{ width: "100%", fontSize: 13, padding: "8px 12px", borderRadius: 8, border: "1px solid #D1D5DB", outline: "none", resize: "vertical", fontFamily: "inherit", boxSizing: "border-box" }} />
+          <button onClick={() => { onSaveNote(localNote); alert("메모 저장됐습니다!"); }} style={{ marginTop: 8, padding: "6px 14px", borderRadius: 8, fontSize: 13, cursor: "pointer", background: C.teal, color: "#fff", border: "none" }}>저장</button>
         </div>
-        {session.matches.map((m,i)=>{
-          const wk=m.draw?null:pairKey(m.winner!);
-          const p1win=!m.draw&&wk===pairKey(m.pair1);
-          const p2win=!m.draw&&wk===pairKey(m.pair2);
-          return(
-            <div key={i} style={{background:"#fff",border:`1px solid ${m.draw?C.amber:p1win?C.teal:C.coral}`,borderRadius:12,padding:"14px 16px"}}>
-              <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}>
-                <span style={{fontSize:12,fontWeight:500,color:C.gray,background:C.grayL,padding:"2px 8px",borderRadius:10}}>게임 {i+1}</span>
-                {m.draw?<span style={{fontSize:12,color:C.amberD,fontWeight:500}}>🤝 무승부 {m.score1}:{m.score2}</span>:<span style={{fontSize:12,color:C.tealD,fontWeight:500}}>✓ {m.score1}:{m.score2}</span>}
-              </div>
-              <div style={{display:"flex",alignItems:"center",gap:10}}>
-                <div style={{flex:1,background:p1win?C.tealL:m.draw?C.amberL:C.grayL,borderRadius:8,padding:"10px",textAlign:"center",border:p1win?`1px solid ${C.teal}`:m.draw?`1px solid ${C.amber}`:"none"}}>
-                  <p style={{fontSize:13,margin:"0 0 4px",fontWeight:500,color:p1win?C.tealD:m.draw?C.amberD:"#111"}}>{m.pair1.join(" & ")}</p>
-                  <p style={{fontSize:22,margin:0,fontWeight:600,color:p1win?C.teal:m.draw?C.amber:C.gray}}>{m.score1}</p>
+
+        {/* 안내 배너 */}
+        <div style={{ background: C.purpleL, border: `1px solid ${C.purple}`, borderRadius: 10, padding: "9px 14px", fontSize: 12, color: C.purpleD, display: "flex", alignItems: "center", gap: 6 }}>
+          <span>✏️</span>
+          <span>각 게임 카드의 <strong>수정</strong> 버튼을 눌러 스코어·페어를 바꿀 수 있습니다. 저장하면 통계에 즉시 반영됩니다.</span>
+        </div>
+
+        {/* 게임 목록 */}
+        {localMatches.map((m, i) => {
+          const isEditing = editingIdx === i;
+          const wk = m.draw ? null : pairKey(m.winner!);
+          const p1win = !m.draw && wk === pairKey(m.pair1);
+          const p2win = !m.draw && wk === pairKey(m.pair2);
+
+          return (
+            <div key={i} style={{ background: "#fff", border: `1px solid ${isEditing ? C.purple : m.draw ? C.amber : p1win ? C.teal : C.coral}`, borderRadius: 12, padding: "14px 16px" }}>
+              {/* 게임 헤더 */}
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10, alignItems: "center" }}>
+                <span style={{ fontSize: 12, fontWeight: 500, color: C.gray, background: C.grayL, padding: "2px 8px", borderRadius: 10 }}>게임 {i + 1}</span>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  {!isEditing && (
+                    <>
+                      {m.draw
+                        ? <span style={{ fontSize: 12, color: C.amberD, fontWeight: 500 }}>🤝 무승부 {m.score1}:{m.score2}</span>
+                        : <span style={{ fontSize: 12, color: C.tealD, fontWeight: 500 }}>✓ {m.score1}:{m.score2}</span>
+                      }
+                      <button
+                        onClick={() => openEdit(i)}
+                        style={{ fontSize: 12, padding: "3px 10px", borderRadius: 8, border: `1px solid ${C.purple}`, background: C.purpleL, color: C.purpleD, cursor: "pointer", fontWeight: 500 }}
+                      >✏️ 수정</button>
+                    </>
+                  )}
+                  {isEditing && (
+                    <span style={{ fontSize: 12, color: C.purpleD, fontWeight: 600, background: C.purpleL, padding: "2px 8px", borderRadius: 8 }}>수정 중</span>
+                  )}
                 </div>
-                <span style={{fontSize:13,color:C.gray}}>{m.draw?"🤝":"vs"}</span>
-                <div style={{flex:1,background:p2win?C.coralL:m.draw?C.amberL:C.grayL,borderRadius:8,padding:"10px",textAlign:"center",border:p2win?`1px solid ${C.coral}`:m.draw?`1px solid ${C.amber}`:"none"}}>
-                  <p style={{fontSize:13,margin:"0 0 4px",fontWeight:500,color:p2win?C.coralD:m.draw?C.amberD:"#111"}}>{m.pair2.join(" & ")}</p>
-                  <p style={{fontSize:22,margin:0,fontWeight:600,color:p2win?C.coral:m.draw?C.amber:C.gray}}>{m.score2}</p>
-                </div>
               </div>
+
+              {/* 수정 모드 */}
+              {isEditing ? (
+                <div style={{ display: "grid", gap: 10 }}>
+                  {/* 페어 선택 */}
+                  <div>
+                    <p style={{ margin: "0 0 6px", fontSize: 12, color: C.gray, fontWeight: 500 }}>페어 변경</p>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <select
+                        value={editPair1.join("||")}
+                        onChange={e => setEditPair1(e.target.value.split("||"))}
+                        style={{ flex: 1, fontSize: 13, padding: "7px 8px", borderRadius: 8, border: `1.5px solid ${C.purple}`, outline: "none", background: "#fff" }}
+                      >
+                        {allPairOpts.map(p => (
+                          <option key={p.join("||")} value={p.join("||")}>{p.join(" & ")}</option>
+                        ))}
+                      </select>
+                      <span style={{ fontSize: 12, color: C.gray, flexShrink: 0 }}>vs</span>
+                      <select
+                        value={editPair2.join("||")}
+                        onChange={e => setEditPair2(e.target.value.split("||"))}
+                        style={{ flex: 1, fontSize: 13, padding: "7px 8px", borderRadius: 8, border: `1.5px solid ${C.purple}`, outline: "none", background: "#fff" }}
+                      >
+                        {allPairOpts.map(p => (
+                          <option key={p.join("||")} value={p.join("||")}>{p.join(" & ")}</option>
+                        ))}
+                      </select>
+                    </div>
+                    {new Set([...editPair1, ...editPair2]).size !== 4 && (
+                      <p style={{ margin: "4px 0 0", fontSize: 11, color: C.coral }}>⚠️ 같은 사람이 두 팀에 포함되어 있습니다.</p>
+                    )}
+                  </div>
+
+                  {/* 스코어 입력 */}
+                  <div>
+                    <p style={{ margin: "0 0 6px", fontSize: 12, color: C.gray, fontWeight: 500 }}>스코어 수정</p>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      <div style={{ flex: 1, textAlign: "center" }}>
+                        <p style={{ margin: "0 0 4px", fontSize: 11, color: C.gray }}>{editPair1.join(" & ")}</p>
+                        <input
+                          type="number" min="0" max="99"
+                          value={editScore1}
+                          onChange={e => setEditScore1(e.target.value)}
+                          style={{ width: "100%", fontSize: 26, padding: "8px 4px", borderRadius: 8, border: `1.5px solid ${C.teal}`, outline: "none", textAlign: "center", fontWeight: 700, boxSizing: "border-box" }}
+                        />
+                      </div>
+                      <span style={{ fontSize: 18, color: C.gray, flexShrink: 0 }}>:</span>
+                      <div style={{ flex: 1, textAlign: "center" }}>
+                        <p style={{ margin: "0 0 4px", fontSize: 11, color: C.gray }}>{editPair2.join(" & ")}</p>
+                        <input
+                          type="number" min="0" max="99"
+                          value={editScore2}
+                          onChange={e => setEditScore2(e.target.value)}
+                          style={{ width: "100%", fontSize: 26, padding: "8px 4px", borderRadius: 8, border: `1.5px solid ${C.coral}`, outline: "none", textAlign: "center", fontWeight: 700, boxSizing: "border-box" }}
+                        />
+                      </div>
+                    </div>
+                    {editScore1 !== "" && editScore2 !== "" && parseInt(editScore1) === parseInt(editScore2) && (
+                      <p style={{ margin: "5px 0 0", fontSize: 11, color: C.amberD, textAlign: "center" }}>🤝 동점 — 저장 시 무승부로 처리됩니다</p>
+                    )}
+                  </div>
+
+                  {/* 저장/취소 버튼 */}
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button onClick={cancelEdit} style={{ flex: 1, padding: "9px", borderRadius: 8, fontSize: 13, cursor: "pointer", border: "1px solid #E5E7EB", background: "#fff", color: C.gray }}>취소</button>
+                    <button
+                      onClick={() => applyEdit(i)}
+                      disabled={new Set([...editPair1, ...editPair2]).size !== 4}
+                      style={{ flex: 2, padding: "9px", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: new Set([...editPair1, ...editPair2]).size === 4 ? "pointer" : "not-allowed", background: new Set([...editPair1, ...editPair2]).size === 4 ? C.purple : "#E5E7EB", color: new Set([...editPair1, ...editPair2]).size === 4 ? "#fff" : C.gray, border: "none" }}
+                    >💾 수정 저장</button>
+                  </div>
+                </div>
+              ) : (
+                /* 조회 모드 */
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <div style={{ flex: 1, background: p1win ? C.tealL : m.draw ? C.amberL : C.grayL, borderRadius: 8, padding: "10px", textAlign: "center", border: p1win ? `1px solid ${C.teal}` : m.draw ? `1px solid ${C.amber}` : "none" }}>
+                    <p style={{ fontSize: 13, margin: "0 0 4px", fontWeight: 500, color: p1win ? C.tealD : m.draw ? C.amberD : "#111" }}>{m.pair1.join(" & ")}</p>
+                    <p style={{ fontSize: 22, margin: 0, fontWeight: 600, color: p1win ? C.teal : m.draw ? C.amber : C.gray }}>{m.score1}</p>
+                  </div>
+                  <span style={{ fontSize: 13, color: C.gray }}>{m.draw ? "🤝" : "vs"}</span>
+                  <div style={{ flex: 1, background: p2win ? C.coralL : m.draw ? C.amberL : C.grayL, borderRadius: 8, padding: "10px", textAlign: "center", border: p2win ? `1px solid ${C.coral}` : m.draw ? `1px solid ${C.amber}` : "none" }}>
+                    <p style={{ fontSize: 13, margin: "0 0 4px", fontWeight: 500, color: p2win ? C.coralD : m.draw ? C.amberD : "#111" }}>{m.pair2.join(" & ")}</p>
+                    <p style={{ fontSize: 22, margin: 0, fontWeight: 600, color: p2win ? C.coral : m.draw ? C.amber : C.gray }}>{m.score2}</p>
+                  </div>
+                </div>
+              )}
             </div>
           );
         })}
@@ -543,6 +662,20 @@ export default function App(){
     }catch(e){alert("메모 저장 실패.");}
   }
 
+  // ─── 지난 세션 게임 수정 저장 ────────────────────────────────
+  async function updateSessionMatches(idx: number, matches: CompletedMatch[]) {
+    const s = sessions[idx];
+    setSyncStatus("syncing");
+    try {
+      if (s.id) await sbFetch(`/sessions?id=eq.${s.id}`, { method: "PATCH", body: JSON.stringify({ matches }) });
+      setSessions(prev => prev.map((ss, i) => i === idx ? { ...ss, matches } : ss));
+      setSyncStatus("ok");
+    } catch (e) {
+      setSyncStatus("error");
+      alert("수정 저장 실패. 다시 시도해주세요.");
+    }
+  }
+
   async function saveGuestDB(g:Guest){
     setSyncStatus("syncing");
     try{
@@ -613,7 +746,6 @@ export default function App(){
   }
 
   function startSession(){
-    // ★ 중복 제거를 가장 먼저 — 정회원+게스트에 같은 이름이 있어도 1명으로 처리
     const players=[...new Set(todayPlayers)];
     if(players.length<4)return alert("최소 4명이 필요합니다.");
     if(players.length>6)return alert("최대 6명까지 가능합니다.");
@@ -621,7 +753,6 @@ export default function App(){
     presentMembers.forEach(m=>{allStatus[m]=memberStatus[m]||"";});
     todayGuests.forEach(g=>{allStatus[g]=guestStatus[g]||"";});
 
-    // 설정한 게임 수만큼 KDK 기준으로 전체 대진을 한번에 생성
     const sched=buildSchedule(players,allStatus,numGames,[]);
     const scoreInputs:Record<number,ScoreInput>={};
     sched.matches.forEach((_,i)=>{scoreInputs[i]=emptyScore();});
@@ -643,7 +774,6 @@ export default function App(){
     setPastSessionIdx(null);setTab(1);
   }
 
-  // 특정 게임의 페어를 수기로 변경 → 이후(다음) 게임들은 중복 없는 페어로 즉시 재계산
   function updateMatchPair(i:number, side:"pair1"|"pair2", pair:string[]){
     if(!activeSession)return;
     const edited:Match={...activeSession.matches[i],[side]:pair};
@@ -651,7 +781,6 @@ export default function App(){
       alert("⚠️ 같은 사람이 두 팀에 동시에 포함될 수 없습니다. 다른 인원을 선택해주세요.");
       return;
     }
-    // i번째까지(수정한 게임 포함)는 고정, 그 이후는 중복 없는 페어로 재계산
     const fixed=[...activeSession.matches.slice(0,i),edited];
     const sched=buildSchedule(activeSession.players,activeSession.playerStatus,activeSession.numGames,fixed);
     setActiveSession(prev=>{
@@ -672,7 +801,6 @@ export default function App(){
     });
   }
 
-  // ─── 스코어 저장(대진은 이미 확정되어 있으므로 결과만 잠금) ───
   function saveScore(idx:number){
     if(!activeSession)return;
     const s=activeSession.scoreInputs[idx]||emptyScore();
@@ -701,7 +829,6 @@ export default function App(){
     setActiveSession(prev=>prev?({...prev,scoreInputs:{...prev.scoreInputs,[idx]:{...prev.scoreInputs[idx],[field]:val}}}):null);
   }
 
-  // 수동으로 게임 추가 (목표 게임 수 초과 시) — 기존 대진은 유지, 마지막에 중복 없는 1게임 추가
   function addGame(){
     if(!activeSession)return;
     const newNumGames=activeSession.numGames+1;
@@ -819,12 +946,9 @@ export default function App(){
   const savedCount=activeSession?Object.values(activeSession.scoreInputs).filter(s=>s.saved).length:0;
   const sortedGuests=[...guests].sort((a,b)=>guestTotalVisits(b.name)-guestTotalVisits(a.name));
 
-  // ─── 인당 실제 게임 수 표시 (스코어 저장 기준) ───────────────
   function PlayerGameCount(){
     if(!activeSession)return null;
     const{players,playerStatus,matches,scoreInputs}=activeSession;
-
-    // 스코어가 저장된 게임만 카운트 (전체 0게임에서 시작, 저장 시 +1)
     const actualCount:Record<string,number>={};
     players.forEach(p=>{actualCount[p]=0;});
     matches.forEach((m,i)=>{
@@ -832,9 +956,6 @@ export default function App(){
         [...m.pair1,...m.pair2].forEach(p=>{actualCount[p]=(actualCount[p]||0)+1;});
       }
     });
-
-    // 아직 저장 안 된 현재 게임도 표시 (진행 중인 게임)
-    // 아직 저장 안 된 첫 번째(=지금 진행해야 할) 게임을 "진행 중"으로 표시
     const currentGameIdx=matches.findIndex((_,idx)=>!scoreInputs[idx]?.saved);
     const currentPlaying=currentGameIdx>=0
       ?[...matches[currentGameIdx].pair1,...matches[currentGameIdx].pair2]
@@ -890,7 +1011,15 @@ export default function App(){
   if(pastSessionIdx!==null&&tab===1){
     const s=sessions[pastSessionIdx];
     if(!s){setPastSessionIdx(null);return null;}
-    return(<PastSessionDetail session={s} onBack={()=>setPastSessionIdx(null)} onDelete={()=>deleteSessionDB(pastSessionIdx)} onSaveNote={note=>updateSessionNote(pastSessionIdx,note)}/>);
+    return(
+      <PastSessionDetail
+        session={s}
+        onBack={()=>setPastSessionIdx(null)}
+        onDelete={()=>deleteSessionDB(pastSessionIdx)}
+        onSaveNote={note=>updateSessionNote(pastSessionIdx,note)}
+        onSaveMatch={matches=>updateSessionMatches(pastSessionIdx,matches)}
+      />
+    );
   }
 
   if(profilePlayer){
@@ -1147,6 +1276,7 @@ export default function App(){
                             {s.note&&<span style={{fontSize:11,color:C.tealD,background:C.tealL,padding:"1px 6px",borderRadius:4}}>📝 {s.note.slice(0,30)}{s.note.length>30?"...":""}</span>}
                           </button>
                           <div style={{display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
+                            <span style={{fontSize:11,color:C.purpleD,background:C.purpleL,padding:"2px 7px",borderRadius:6,border:`1px solid ${C.purple}`,cursor:"pointer"}} onClick={()=>setPastSessionIdx(realIdx)}>✏️ 수정</span>
                             <span style={{fontSize:12,color:C.teal,fontWeight:500}}>{s.matches.length}게임</span>
                             <button onClick={()=>deleteSessionDB(realIdx)} style={{fontSize:11,padding:"3px 8px",borderRadius:6,border:"1px solid #FECACA",background:"#FEF2F2",color:C.coral,cursor:"pointer"}}>삭제</button>
                           </div>
@@ -1176,7 +1306,6 @@ export default function App(){
                   </div>
                 </div>
 
-                {/* 인당 게임 수 현황 */}
                 <PlayerGameCount/>
 
                 <div style={{display:"grid",gap:10,marginBottom:14}}>
@@ -1185,14 +1314,11 @@ export default function App(){
                     const pl=activeSession.players;
                     const allPairOpts:string[][]=[];
                     for(let a=0;a<pl.length;a++)for(let b=a+1;b<pl.length;b++)allPairOpts.push([pl[a],pl[b]]);
-                    // 상대 팀과 인원이 겹치지 않는 조합만 선택 가능하게 필터링 (오류 대진 원천 차단)
-                   // 수동 수정 시 모든 페어 조합 표시
-const pair1Opts = allPairOpts;
-const pair2Opts = allPairOpts;
+                    const pair1Opts = allPairOpts;
+                    const pair2Opts = allPairOpts;
                     const matchInvalid=!isValidMatch(m);
                     const drawNow=s.a!==""&&s.b!==""&&parseInt(s.a)===parseInt(s.b);
 
-                    // 이 게임에서 쉬는 사람
                     const playingNow=[...m.pair1,...m.pair2];
                     const restingNow=pl.filter(p=>{
                       const st=activeSession.playerStatus[p]||"";
@@ -1201,7 +1327,6 @@ const pair2Opts = allPairOpts;
                       return !playingNow.includes(p);
                     });
 
-                    // 저장 안 된 게임 중 가장 첫 번째 = 지금 진행할 게임
                     const isCurrentGame=!s.saved&&activeSession.matches.findIndex((_,idx)=>!(activeSession.scoreInputs[idx]?.saved))===i;
 
                     return(
